@@ -32,6 +32,7 @@ LICENSE = "1f8729233617b193fd619213792ae16a41b95d2bbbf525dfe66998252ba68b16"
 SDK_LICENSE_SHA1 = "24333f8a63b6825ea9c5514f83c2829b004d1fee"
 W, H = 1080, 1920
 SERIAL, PORT = "emulator-5556", "5038"
+AVD_NAME = "PublicPhoneCapture"
 BOOT_LIMIT = 16384
 BOOT_OMISSION = b"\n[bounded startup output: middle omitted]\n"
 
@@ -141,6 +142,50 @@ def disk_free(sdk, state):
 
 def can_retain_boot(status, apk_install_started, organization_paired, process_started, emulator_stopped):
     return status == "failed" and not apk_install_started and not organization_paired and process_started and emulator_stopped
+
+
+def create_avd_roots(state):
+    # The SDK's PathLocator ignores ANDROID_AVD_HOME unless it already exists.
+    # Make it before the first SDK process can cache a fallback registry path.
+    need(state.is_dir() and not state.is_symlink(), "AVD_STATE_INVALID")
+    avd_home, user_home = state / "avd", state / "android-user"
+    avd_home.mkdir(mode=0o700)
+    user_home.mkdir(mode=0o700)
+    return avd_home, user_home
+
+
+def read_avd_ini(path):
+    need(path.is_file() and not path.is_symlink(), "AVD_METADATA_MISSING")
+    need(path.stat().st_size <= 65536, "AVD_METADATA_TOO_LARGE")
+    values = {}
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        need("=" in line, "AVD_METADATA_INVALID")
+        key, value = [piece.strip() for piece in line.split("=", 1)]
+        need(key and key not in values and "\0" not in value, "AVD_METADATA_INVALID")
+        values[key] = value
+    return values
+
+
+def validate_avd(state, avd_home, avd_data, sdk):
+    root = state.resolve()
+    need(avd_home.resolve().parent == root and avd_data.resolve().parent == avd_home.resolve()
+         and not avd_home.is_symlink() and not avd_data.is_symlink(), "AVD_STATE_PATH_MISMATCH")
+    index_path = avd_home / (AVD_NAME + ".ini")
+    need(index_path.is_file(), "AVD_REGISTRY_INDEX_MISSING")
+    index = read_avd_ini(index_path)
+    need("path" in index and Path(index["path"]).is_absolute() and Path(index["path"]).resolve() == avd_data.resolve(), "AVD_REGISTRY_PATH_MISMATCH")
+    config = read_avd_ini(avd_data / "config.ini")
+    need(config.get("abi.type") == "x86_64" and config.get("hw.cpu.arch") == "x86_64" and config.get("tag.id") == "google_apis", "AVD_IMAGE_IDENTITY_MISMATCH")
+    need(not any(key.startswith("image.sysdir.") and key != "image.sysdir.1" for key in config), "AVD_IMAGE_PATH_MISMATCH")
+    image = Path(config.get("image.sysdir.1", ""))
+    image = image if image.is_absolute() else sdk / image
+    need(image.resolve() == (sdk / "system-images/android-36/google_apis/x86_64").resolve(), "AVD_IMAGE_PATH_MISMATCH")
+    need(config.get("AvdId", AVD_NAME) == AVD_NAME, "AVD_NAME_MISMATCH")
+    return {"registryIndexPresent": True, "registryPathMatches": True, "dataInsideOwnedState": True,
+            "configImageMatches": True, "api": 36, "abi": "x86_64"}
 
 
 def check_sdk_result(exit_code, output):
@@ -387,9 +432,11 @@ def run(pins):
     artifacts = state / "artifacts"
     artifacts.mkdir(mode=0o700)
     (artifacts / "raw").mkdir(mode=0o700)
+    avd_home, user_home = create_avd_roots(state)
+    avd_data = avd_home / (AVD_NAME + ".avd")
     deadline, started, process, stage = time.monotonic() + 18 * 60, time.monotonic(), None, "preflight"
     adb_started, apk_install_started = False, False
-    env = {**os.environ, "ANDROID_AVD_HOME": str(state / "avd"), "ANDROID_USER_HOME": str(state / "android-user"), "ANDROID_ADB_SERVER_PORT": PORT}
+    env = {**os.environ, "ANDROID_AVD_HOME": str(avd_home), "ANDROID_USER_HOME": str(user_home), "ANDROID_ADB_SERVER_PORT": PORT}
     evidence = {"status": "running", "distribution": "public standalone APK; shared pairing/privacy UI", "phoneImage": IMAGE,
                 "apkSha256": APK_SHA256, "organizationPaired": False, "playStoreInstallVerified": False, "captures": []}
     stage_history = [stage]
@@ -463,7 +510,14 @@ def run(pins):
         need("name='com.websignly.player'" in badging and "versionCode='4'" in badging and "versionName='1.0.3'" in badging, "PUBLIC_APK_IDENTITY_UNEXPECTED")
         profiles = command([avd, "list", "devices"], "PHONE_PROFILE_MISSING").decode(errors="replace")
         need('"pixel_2"' in profiles, "PHONE_PROFILE_MISSING")
-        command([avd, "create", "avd", "-n", "PublicPhoneCapture", "-k", IMAGE, "-d", "pixel_2"], "AVD_CREATE_FAILED", data=b"no\n")
+        need(not avd_data.exists(), "AVD_DATA_ALREADY_EXISTS")
+        command([avd, "create", "avd", "-n", AVD_NAME, "-k", IMAGE, "-d", "pixel_2", "-p", avd_data], "AVD_CREATE_FAILED", data=b"no\n")
+        stage = "AVD_REGISTRY_VALIDATION"
+        stage_history.append(stage)
+        evidence["avdIdentity"] = validate_avd(state, avd_home, avd_data, sdk)
+        listed = command([binary, "-list-avds"], "EMULATOR_AVD_DISCOVERY_FAILED").decode(errors="replace")
+        need(AVD_NAME in [line.strip() for line in listed.splitlines()], "EMULATOR_AVD_DISCOVERY_FAILED")
+        evidence["emulatorListsAvd"] = True
         for port in (int(PORT), 5556, 5557):
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", port))
@@ -471,7 +525,7 @@ def run(pins):
         adb_started = True
         evidence["diskFreeBytesBeforeLaunch"] = disk_free(sdk, state)
         with (state / "emulator.log").open("wb") as log:
-            process = subprocess.Popen([str(binary), "-avd", "PublicPhoneCapture", "-port", "5556", "-no-window", "-no-audio", "-no-boot-anim",
+            process = subprocess.Popen([str(binary), "-avd", AVD_NAME, "-port", "5556", "-no-window", "-no-audio", "-no-boot-anim",
                                         "-no-snapshot", "-no-metrics", "-gpu", "swiftshader", "-accel", "on", "-cores", "2", "-memory", "3072",
                                         "-camera-back", "none", "-camera-front", "none"], stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         boot_end, booted = min(deadline, time.monotonic() + 240), False
@@ -772,6 +826,30 @@ def self_test():
     with tempfile.TemporaryDirectory(prefix="public-phone-disk-test-") as temporary:
         free = disk_free(Path(temporary), Path(temporary))
         checks.append(type(free["sdk"]) is int and free["sdk"] > 0 and free["state"] > 0)
+    with tempfile.TemporaryDirectory(prefix="public-phone-avd-test-") as temporary:
+        state = Path(temporary)
+        avd_home, user_home = create_avd_roots(state)
+        checks.append(avd_home.is_dir() and user_home.is_dir() and avd_home.parent == state and user_home.parent == state)
+        sdk, avd_data = state / "sdk", avd_home / (AVD_NAME + ".avd")
+        avd_data.mkdir()
+        checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
+        index = avd_home / (AVD_NAME + ".ini")
+        index.write_text("path=" + str(avd_data.resolve()) + "\ntarget=android-36\n")
+        config = avd_data / "config.ini"
+        valid_config = "abi.type=x86_64\nhw.cpu.arch=x86_64\ntag.id=google_apis\nimage.sysdir.1=system-images/android-36/google_apis/x86_64/\nAvdId=" + AVD_NAME + "\n"
+        config.write_text(valid_config)
+        checks.append(validate_avd(state, avd_home, avd_data, sdk)["configImageMatches"] is True)
+        index.write_text("path=" + str((state.parent / "outside-data").resolve()) + "\n")
+        checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
+        index.write_text("path=" + str(avd_data.resolve()) + "\n")
+        config.write_text(valid_config.replace("android-36", "android-35"))
+        checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
+        config.write_text(valid_config.replace("abi.type=x86_64", "abi.type=arm64-v8a"))
+        checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
+        config.write_text(valid_config + "image.sysdir.2=unapproved-image\n")
+        checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
+        config.write_text(valid_config + "abi.type=x86_64\n")
+        checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
     need(all(checks), "SYNTHETIC_CHECK_FAILED")
     print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
 
