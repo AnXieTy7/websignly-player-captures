@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 import zlib
 
@@ -37,6 +38,87 @@ class Refused(Exception):
 def need(value, code):
     if not value:
         raise Refused(code)
+
+
+def safe_error(error):
+    code = str(error) if isinstance(error, Refused) else "CAPTURE_OPERATION_FAILED"
+    value = {"error": code if re.fullmatch(r"[A-Z0-9_]{1,80}", code) else "CAPTURE_OPERATION_FAILED",
+             "exceptionType": type(error).__name__}
+    if isinstance(error, OSError) and type(error.errno) is int:
+        value["errno"] = error.errno
+    if type(getattr(error, "exit_code", None)) is int:
+        value["commandExitCode"] = error.exit_code
+    if getattr(error, "operation_phase", None) in {"license_backup", "license_setup", "sdk_command"}:
+        value["operationPhase"] = error.operation_phase
+    if getattr(error, "sdk_diagnostic", None) in {"SDK_LICENSE_NOT_ACCEPTED", "SDK_JAVA_HOME_INVALID", "SDK_JAVA_VERSION_INVALID", "SDK_PACKAGE_UNAVAILABLE", "SDK_INSTALL_PERMISSIONS", "SDK_INSTALL_OTHER"}:
+        value["sdkDiagnostic"] = error.sdk_diagnostic
+    if getattr(error, "cleanup_errors", None):
+        value["cleanupErrors"] = error.cleanup_errors
+    return value
+
+
+def sdk_diagnostic(output):
+    text = output.decode("utf-8", errors="replace").lower()
+    if "license" in text and any(term in text for term in ("not accepted", "not been accepted", "accept the sdk license", "review licenses")):
+        return "SDK_LICENSE_NOT_ACCEPTED"
+    if "java_home" in text and any(term in text for term in ("not set", "invalid", "not found")):
+        return "SDK_JAVA_HOME_INVALID"
+    if "unsupportedclassversionerror" in text or "java version 17" in text:
+        return "SDK_JAVA_VERSION_INVALID"
+    if "failed to find package" in text or "package path is not valid" in text:
+        return "SDK_PACKAGE_UNAVAILABLE"
+    if "permission denied" in text or "failed to read or create install properties" in text:
+        return "SDK_INSTALL_PERMISSIONS"
+    return "SDK_INSTALL_OTHER"
+
+
+def with_reviewed_licenses(sdk, state, hashes, operation):
+    """Restore runner licenses without masking an install failure or deleting SDK-created files."""
+    license_dir = sdk / "licenses"
+    token = uuid.uuid4().hex
+    # SDK and RUNNER_TEMP may be different filesystems. Adjacent siblings keep
+    # every rename atomic on the SDK filesystem, including error restoration.
+    backup = sdk / (".phone-capture-license-backup-" + token)
+    quarantine = sdk / (".phone-capture-license-state-" + token)
+    created, primary = False, None
+    phase = "license_backup"
+    need(not any(p.exists() or p.is_symlink() for p in (backup, quarantine)), "LICENSE_RESTORE_STATE_ALREADY_EXISTS")
+    try:
+        if license_dir.exists():
+            license_dir.rename(backup)
+        phase = "license_setup"
+        license_dir.mkdir()
+        created = True
+        (license_dir / "android-sdk-license").write_text("\n".join(sorted(hashes)) + "\n")
+        phase = "sdk_command"
+        return operation()
+    except BaseException as error:
+        error.operation_phase = phase
+        primary = error
+        raise
+    finally:
+        failures = []
+        try:
+            # SDKmanager can create additional files here. Preserve the entire
+            # generated directory outside its accepted-license location rather
+            # than rmdir(), which would replace the primary failure with ENOTEMPTY.
+            if created and license_dir.exists():
+                license_dir.rename(quarantine)
+        except Exception as error:
+            failures.append(safe_error(error))
+        try:
+            if backup.exists():
+                need(not license_dir.exists(), "SDK_LICENSE_RESTORE_PATH_OCCUPIED")
+                backup.rename(license_dir)
+        except Exception as error:
+            failures.append(safe_error(error))
+        if failures:
+            if primary is not None:
+                primary.cleanup_errors = failures
+            else:
+                error = Refused("SDK_LICENSE_RESTORE_FAILED")
+                error.cleanup_errors = failures
+                raise error
 
 
 def tag(node):
@@ -197,17 +279,25 @@ def run(pins):
     env = {**os.environ, "ANDROID_AVD_HOME": str(state / "avd"), "ANDROID_USER_HOME": str(state / "android-user"), "ANDROID_ADB_SERVER_PORT": PORT}
     evidence = {"status": "running", "distribution": "public standalone APK; shared pairing/privacy UI", "phoneImage": IMAGE,
                 "apkSha256": APK_SHA256, "organizationPaired": False, "playStoreInstallVerified": False, "captures": []}
+    stage_history = [stage]
     def command(args, code, seconds=60, data=None):
         nonlocal stage
         stage = code
+        stage_history.append(stage)
         remaining = min(seconds, int(deadline - time.monotonic()))
         need(remaining > 0, "TIME_BUDGET_EXHAUSTED")
         with (state / "command.log").open("wb") as stream:
             result = subprocess.run([str(a) for a in args], input=data, stdin=subprocess.DEVNULL if data is None else None, stdout=stream,
                                     stderr=subprocess.STDOUT, timeout=remaining, cwd=state, env=env)
-        need(result.returncode == 0, code)
         need((state / "command.log").stat().st_size <= 8 * 1024**2, "COMMAND_OUTPUT_TOO_LARGE")
-        return (state / "command.log").read_bytes()
+        output = (state / "command.log").read_bytes()
+        if result.returncode != 0:
+            error = Refused(code)
+            error.exit_code = result.returncode
+            if code == "SDK_INSTALL_FAILED":
+                error.sdk_diagnostic = sdk_diagnostic(output)
+            raise error
+        return output
     adb = sdk / "platform-tools/adb"
     tools = sdk / "build-tools/35.0.0"
     manager, avd = [sdk / ("cmdline-tools/latest/bin/" + n) for n in ("sdkmanager", "avdmanager")]
@@ -240,19 +330,7 @@ def run(pins):
         need(all(p.exists() for p in (adb, tools / "aapt", tools / "apksigner", manager, avd)), "PREINSTALLED_TOOLS_MISSING")
         licenses = inspect_catalog(fetch(CATALOG, 8*1024**2), "emulator", pins["emulatorRevision"], pins["emulatorArchive"], {})
         licenses |= inspect_catalog(fetch(PHONE_CATALOG, 8*1024**2), IMAGE, pins["imageRevision"], pins["imageArchive"], pins["imageDependencies"])
-        license_dir, backup = sdk / "licenses", state / "runner-licenses"
-        if license_dir.exists():
-            license_dir.rename(backup)
-        license_dir.mkdir()
-        license_file = license_dir / "android-sdk-license"
-        try:
-            license_file.write_text("\n".join(sorted(licenses)) + "\n")
-            command([manager, "--channel=0", "emulator", IMAGE], "SDK_INSTALL_FAILED", 480)
-        finally:
-            license_file.unlink(missing_ok=True)
-            license_dir.rmdir()
-            if backup.exists():
-                backup.rename(license_dir)
+        with_reviewed_licenses(sdk, state, licenses, lambda: command([manager, "--channel=0", "emulator", IMAGE], "SDK_INSTALL_FAILED", 480))
         for folder, package, wanted in (("emulator", "emulator", pins["emulatorRevision"]), ("system-images/android-36/google_apis/x86_64", IMAGE, pins["imageRevision"])):
             installed = ET.fromstring((sdk / folder / "package.xml").read_bytes())
             matches = [n for n in installed if tag(n) == "localPackage" and n.get("path") == package]
@@ -322,7 +400,8 @@ def run(pins):
         need(pairing(dump()), "DIALOG_BACK_FAILED")
         evidence["status"] = "passed"
     except Exception as error:
-        evidence["status"], evidence["error"] = "failed", str(error) if isinstance(error, Refused) else "CAPTURE_OPERATION_FAILED"
+        evidence["status"] = "failed"
+        evidence.update(safe_error(error))
         raise
     finally:
         if process is not None:
@@ -341,8 +420,9 @@ def run(pins):
             except Exception:
                 pass
         evidence["stage"], evidence["elapsedSeconds"] = stage, round(time.monotonic() - started)
+        evidence["stageHistory"] = stage_history[-32:]
         (artifacts / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
-        print(json.dumps({"status": evidence["status"], "stage": stage, "captures": len(evidence["captures"])}))
+        print(json.dumps({key: evidence[key] for key in ("status", "stage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
 
 
 def self_test():
@@ -424,6 +504,62 @@ def self_test():
     checks.append(rejects(lambda: inspect_fixture(image_catalog, IMAGE, pins["imageRevision"], pins["imageArchive"], {})))
     checks.append(rejects(lambda: inspect_fixture(image_catalog, IMAGE, pins["imageRevision"], {**pins["imageArchive"], "sha1": "0" * 40}, pins["imageDependencies"])))
     checks.append(rejects(lambda: inspect_catalog(image_catalog, IMAGE, pins["imageRevision"], pins["imageArchive"], pins["imageDependencies"])))
+    # Synthetic directories and injected failures only; never invoke SDKmanager.
+    import tempfile
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory(prefix="public-phone-license-test-") as temporary:
+        base = Path(temporary)
+        sdk, state = base / "sdk", base / "state"
+        (sdk / "licenses").mkdir(parents=True)
+        state.mkdir()
+        (sdk / "licenses" / "original-license").write_text("original synthetic content")
+        failure = Refused("SDK_INSTALL_FAILED")
+        def install_failure():
+            need(set(p.name for p in (sdk / "licenses").iterdir()) == {"android-sdk-license"}, "FIXTURE_EXTRA_ACCEPTANCE")
+            (sdk / "licenses" / "extra-sdk-file").write_text("synthetic SDK output")
+            raise failure
+        try:
+            with_reviewed_licenses(sdk, state, {"a" * 40}, install_failure)
+            checks.append(False)
+        except Refused as observed:
+            checks.append(observed is failure and str(observed) == "SDK_INSTALL_FAILED")
+        checks.append((sdk / "licenses" / "original-license").read_text() == "original synthetic content")
+        quarantines = list(sdk.glob(".phone-capture-license-state-*"))
+        checks.append(len(quarantines) == 1 and (quarantines[0] / "extra-sdk-file").read_text() == "synthetic SDK output")
+        checks.append(not (sdk / "licenses" / "android-sdk-license").exists())
+    with tempfile.TemporaryDirectory(prefix="public-phone-license-test-") as temporary:
+        base = Path(temporary)
+        sdk, state = base / "sdk", base / "state"
+        sdk.mkdir()
+        state.mkdir()
+        original_rename = Path.rename
+        failure = Refused("SDK_INSTALL_FAILED")
+        def fail_cleanup(path, target):
+            if Path(target).name.startswith(".phone-capture-license-state-"):
+                raise PermissionError(13, "synthetic-hidden-message")
+            return original_rename(path, target)
+        with patch.object(Path, "rename", fail_cleanup):
+            try:
+                with_reviewed_licenses(sdk, state, {"a" * 40}, lambda: (_ for _ in ()).throw(failure))
+                checks.append(False)
+            except Refused as observed:
+                checks.append(observed is failure and safe_error(observed)["cleanupErrors"][0]["errno"] == 13)
+    with tempfile.TemporaryDirectory(prefix="public-phone-license-test-") as temporary:
+        base = Path(temporary)
+        sdk, state = base / "sdk", base / "state"
+        sdk.mkdir()
+        state.mkdir()
+        with patch.object(Path, "rename", fail_cleanup):
+            try:
+                with_reviewed_licenses(sdk, state, {"a" * 40}, lambda: None)
+                checks.append(False)
+            except Refused as observed:
+                checks.append(str(observed) == "SDK_LICENSE_RESTORE_FAILED")
+    checks.append(safe_error(FileNotFoundError(2, "synthetic-hidden-value", "/synthetic/private-name")) == {"error": "CAPTURE_OPERATION_FAILED", "exceptionType": "FileNotFoundError", "errno": 2})
+    checks.append("synthetic-hidden-message" not in json.dumps(safe_error(failure)))
+    checks.append(sdk_diagnostic(b"Warning: License for package emulator not accepted. synthetic-hidden-value") == "SDK_LICENSE_NOT_ACCEPTED")
+    checks.append(sdk_diagnostic(b"Error: JAVA_HOME is set to an invalid directory") == "SDK_JAVA_HOME_INVALID")
+    checks.append(sdk_diagnostic(b"unknown synthetic-hidden-value") == "SDK_INSTALL_OTHER")
     need(all(checks), "SYNTHETIC_CHECK_FAILED")
     print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
 
@@ -439,5 +575,5 @@ if __name__ == "__main__":
         else:
             raise Refused("USE_PLAN_SELF_TEST_OR_RUN")
     except Exception as error:
-        print(json.dumps({"status": "refused", "error": str(error) if isinstance(error, Refused) else "CAPTURE_OPERATION_FAILED"}))
+        print(json.dumps({"status": "refused", **safe_error(error)}))
         sys.exit(1)
