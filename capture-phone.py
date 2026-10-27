@@ -359,6 +359,63 @@ def pairing(data):
     return any(re.fullmatch(r"[0-9]{6}", t) for t in values) and any("Your next great screen" in t for t in values)
 
 
+def settings(data):
+    values = [n.get("text", "") for n in ui(data)]
+    return ("PLAYER SETTINGS" in values and "Privacy policy" in values
+            and any("Ready to pair" in t and "Active revision: none" in t for t in values)
+            and not any("Unpair and remove local content" in t for t in values))
+
+
+def transition_wait(read, check, observe, seconds=20, clock=time.monotonic, pause=time.sleep):
+    deadline = clock() + seconds
+    last = b"<hierarchy/>"
+    while clock() < deadline:
+        last = read()
+        try:
+            if check(last):
+                observed = observe(last, True)
+                if isinstance(observed, dict) and observed.get("imeDismissAttempted"):
+                    pause(.3)
+                    continue
+                return last
+        except Refused as error:
+            if str(error) != "NATIVE_UI_MISSING":
+                raise
+        observe(last, True)
+        pause(.3)
+    observe(last, False)
+    raise Refused("UI_TRANSITION_TIMEOUT")
+
+
+def ui_diagnostics(data, input_method, owned_foreground, native_pid):
+    root = ET.fromstring(data)
+    packages = sorted({n.get("package", "") for n in root.iter("node")
+                       if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+", n.get("package", ""))})[:16]
+    shown = bool(re.search(r"(?:mInputShown|isInputShown)\s*=\s*true\b", input_method))
+    visible = (bool(re.search(r"mIsInputViewShown\s*=\s*true\b", input_method)) or
+               any(int(value, 16) & 2 for value in re.findall(r"mImeWindowVis\s*=\s*0x([0-9a-fA-F]+)", input_method)))
+    allowed_labels = ("PLAYER SETTINGS", "Privacy policy", "Ready to pair", "Active revision: none", "Proof events waiting: 0", "WebSignly privacy policy", "Close")
+    labels = sorted({label for n in root.iter("node") if n.get("package") == PACKAGE
+                     for label in allowed_labels if label in n.get("text", "")})
+    ime_packages = sorted(set(re.findall(r"(?:mCurId|mCurMethodId)\s*=\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)/", input_method)))[:4]
+    return {"ownedForeground": owned_foreground, "nativePidPresent": native_pid,
+            "imeShown": shown, "imeVisible": visible, "imePackages": ime_packages, "packages": packages, "ownLabels": labels}
+
+
+def can_hide_ime(snapshot, phase):
+    keyboards = {"com.google.android.inputmethod.latin", "com.android.inputmethod.latin"}
+    return (phase in {"SETTINGS_TRANSITION", "PRIVACY_TRANSITION"} and snapshot["ownedForeground"]
+            and snapshot["nativePidPresent"] and snapshot["imeShown"] and snapshot["imeVisible"]
+            and bool(keyboards.intersection(snapshot["packages"] + snapshot["imePackages"])))
+
+
+def can_retain_ui(snapshot, unpaired_flow, organization_paired):
+    allowed = {PACKAGE, "android", "com.android.systemui", "com.google.android.inputmethod.latin", "com.android.inputmethod.latin"}
+    return (unpaired_flow and not organization_paired and snapshot["ownedForeground"]
+            and snapshot["nativePidPresent"] and bool(snapshot["packages"])
+            and set(snapshot["packages"]).issubset(allowed))
+
+
 def privacy(data):
     values = [n.get("text", "") for n in ui(data)]
     return "WebSignly privacy policy" in values and any("WebOrbit LLC" in t for t in values) and "Close" in values and not any("Loading privacy policy" in t for t in values)
@@ -436,10 +493,13 @@ def run(pins):
     avd_data = avd_home / (AVD_NAME + ".avd")
     deadline, started, process, stage = time.monotonic() + 18 * 60, time.monotonic(), None, "preflight"
     adb_started, apk_install_started = False, False
+    unpaired_flow, ime_hidden, last_observation = False, False, 0.0
+    ui_phase, last_ui_data, last_ui_snapshot = "PAIRING_WAIT", b"<hierarchy/>", None
     env = {**os.environ, "ANDROID_AVD_HOME": str(avd_home), "ANDROID_USER_HOME": str(user_home), "ANDROID_ADB_SERVER_PORT": PORT}
-    evidence = {"status": "running", "distribution": "public standalone APK; shared pairing/privacy UI", "phoneImage": IMAGE,
+    evidence = {"status": "running", "distribution": "public standalone APK; pairing/privacy shared, settings channel may differ", "phoneImage": IMAGE,
                 "apkSha256": APK_SHA256, "organizationPaired": False, "playStoreInstallVerified": False, "captures": []}
     stage_history = [stage]
+    evidence["uiStageHistory"] = [ui_phase]
     def command(args, code, seconds=60, data=None):
         nonlocal stage
         stage = code
@@ -468,9 +528,11 @@ def run(pins):
     def dump():
         device("shell", "uiautomator", "dump", "--compressed", "/data/local/tmp/phone-ui.xml")
         return device("exec-out", "cat", "/data/local/tmp/phone-ui.xml")
-    def tap_text(text):
+    def tap_text(text, initial=None):
         for _ in range(7):
-            for n in ui(dump()):
+            data = initial if initial is not None else dump()
+            initial = None
+            for n in ui(data):
                 if n.get("text") == text and n.get("enabled") == "true":
                     match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds", ""))
                     if match:
@@ -482,12 +544,45 @@ def run(pins):
         raise Refused("NATIVE_BUTTON_NOT_FOUND")
     def capture(name, check):
         need(foreground(device("shell", "dumpsys", "activity", "activities").decode(errors="replace")), "APP_NOT_FOREGROUND")
-        need(check(dump()), "CAPTURE_UI_INVALID")
+        data = dump()
+        need(check(data), "CAPTURE_UI_INVALID")
         raw = device("exec-out", "screencap", "-p")
         rgb = png_rgb(raw)
         (artifacts / "raw" / name).write_bytes(raw)
         (artifacts / name).write_bytes(rgb)
         evidence["captures"].append({"name": name, "width": W, "height": H, "rgbBytes": len(rgb), "rgbSha256": hashlib.sha256(rgb).hexdigest(), "rawSha256": hashlib.sha256(raw).hexdigest()})
+        return data
+    def observe_transition(data, allow_hide):
+        nonlocal last_observation, ime_hidden, last_ui_data, last_ui_snapshot
+        last_ui_data = data
+        if allow_hide and time.monotonic() - last_observation < 1:
+            return
+        last_observation = time.monotonic()
+        owned = foreground(device("shell", "dumpsys", "activity", "activities").decode(errors="replace"))
+        try:
+            native_pid = bool(re.fullmatch(rb"\d+(?:\s+\d+)*", device("shell", "pidof", PACKAGE).strip()))
+        except Refused:
+            native_pid = False
+        method = device("shell", "dumpsys", "input_method").decode(errors="replace")
+        snapshot = ui_diagnostics(data, method, owned, native_pid)
+        last_ui_snapshot = snapshot
+        evidence.setdefault("uiDiagnostics", []).append({"phase": ui_phase, **snapshot})
+        evidence["uiDiagnostics"] = evidence["uiDiagnostics"][-8:]
+        if allow_hide and not ime_hidden and can_hide_ime(snapshot, ui_phase):
+            snapshot["imeDismissAttempted"] = True
+            evidence.setdefault("imeDismissals", []).append(ui_phase)
+            ime_hidden = True
+            device("shell", "input", "keyevent", "KEYCODE_BACK")
+        if not allow_hide:
+            need(owned, "PLAYER_LEFT_FOREGROUND_DURING_UI")
+            need(native_pid, "PLAYER_NATIVE_PID_UNVERIFIED")
+        return snapshot
+    def wait_ui(phase, check, seconds=20):
+        nonlocal ui_phase, ime_hidden, last_observation
+        ui_phase, ime_hidden, last_observation = phase, False, 0.0
+        evidence["uiStage"] = phase
+        evidence["uiStageHistory"].append(phase)
+        return transition_wait(dump, check, observe_transition, seconds)
     try:
         need(all(p.exists() for p in (adb, tools / "aapt", tools / "apksigner", manager, avd)), "PREINSTALLED_TOOLS_MISSING")
         licenses = inspect_catalog(fetch(CATALOG, 8*1024**2), "emulator", pins["emulatorRevision"], pins["emulatorArchive"], {})
@@ -559,24 +654,32 @@ def run(pins):
                 break
             time.sleep(3)
         need(ready, "PAIRING_UI_NOT_READY")
-        capture("01-pairing.png", pairing)
-        tap_text("Settings")
-        tap_text("Privacy policy")
-        ready_end, ready = min(deadline, time.monotonic() + 45), False
-        while time.monotonic() < ready_end:
-            if privacy(dump()):
-                ready = True
-                break
-            time.sleep(3)
-        need(ready, "PRIVACY_UI_NOT_READY")
-        capture("02-privacy.png", privacy)
-        device("shell", "input", "keyevent", "KEYCODE_BACK")
-        device("shell", "input", "keyevent", "KEYCODE_BACK")
-        need(pairing(dump()), "DIALOG_BACK_FAILED")
+        pairing_data = capture("01-pairing.png", pairing)
+        unpaired_flow = True
+        tap_text("Settings", pairing_data)
+        wait_ui("SETTINGS_TRANSITION", settings)
+        settings_data = capture("02-settings.png", settings)
+        tap_text("Privacy policy", settings_data)
+        wait_ui("PRIVACY_TRANSITION", privacy, 45)
+        privacy_data = capture("03-privacy.png", privacy)
+        tap_text("Close", privacy_data)
+        returned_settings = wait_ui("SETTINGS_TRANSITION", settings)
+        tap_text("Resume playback", returned_settings)
+        wait_ui("PAIRING_RETURN", pairing)
         evidence["status"] = "passed"
     except Exception as error:
         evidence["status"] = "failed"
         evidence.update(safe_error(error))
+        if isinstance(error, Refused) and str(error) in {"UI_TRANSITION_TIMEOUT", "NATIVE_UI_MISSING", "PLAYER_LEFT_FOREGROUND_DURING_UI", "PLAYER_NATIVE_PID_UNVERIFIED"}:
+            try:
+                snapshot = observe_transition(dump(), False)
+                if snapshot and can_retain_ui(snapshot, unpaired_flow, evidence["organizationPaired"]):
+                    diagnostic = png_rgb(device("exec-out", "screencap", "-p"))
+                    need(foreground(device("shell", "dumpsys", "activity", "activities").decode(errors="replace")), "APP_NOT_FOREGROUND")
+                    (artifacts / "ui-diagnostic-unpaired.png").write_bytes(diagnostic)
+                    evidence["uiDiagnosticCaptureRetained"] = True
+            except Exception as diagnostic_error:
+                evidence["uiDiagnosticError"] = safe_error(diagnostic_error)
         raise
     finally:
         evidence["apkInstallAttempted"] = apk_install_started
@@ -635,7 +738,7 @@ def run(pins):
         evidence["stage"], evidence["elapsedSeconds"] = stage, round(time.monotonic() - started)
         evidence["stageHistory"] = stage_history[-32:]
         (artifacts / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
-        print(json.dumps({key: evidence[key] for key in ("status", "stage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "sdkCommandExitCode", "sdkWarningCodes", "sdkPackage", "expectedMetadata", "sourcePropertiesExists", "emulatorExitCode", "bootDeadlineReached", "diskFreeBytesBeforeLaunch", "diskFreeBytesAfterFailure", "bootStartupCodes", "emulatorStopped", "bootOutputRetained", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
+        print(json.dumps({key: evidence[key] for key in ("status", "stage", "uiStage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "sdkCommandExitCode", "sdkWarningCodes", "sdkPackage", "expectedMetadata", "sourcePropertiesExists", "emulatorExitCode", "bootDeadlineReached", "diskFreeBytesBeforeLaunch", "diskFreeBytesAfterFailure", "bootStartupCodes", "emulatorStopped", "bootOutputRetained", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
 
 
 def self_test():
@@ -850,6 +953,45 @@ def self_test():
         checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
         config.write_text(valid_config + "abi.type=x86_64\n")
         checks.append(rejects(lambda: validate_avd(state, avd_home, avd_data, sdk)))
+    tick, observations = [0.0], []
+    def now():
+        return tick[0]
+    def pause(seconds):
+        tick[0] += seconds
+    transient = iter([xml(["keyboard"], "com.android.inputmethod.latin"), xml(["ready"])])
+    checks.append(transition_wait(lambda: next(transient), lambda data: "ready" in [n.get("text") for n in ui(data)],
+                                  lambda data, active: observations.append(active), 2, now, pause) == xml(["ready"]))
+    checks.append(observations == [True, True])
+    failures = [0]
+    def invalid_check(data):
+        failures[0] += 1
+        raise Refused("UI_DUMP_TOO_LARGE")
+    checks.append(rejects(lambda: transition_wait(lambda: b"", invalid_check, lambda *_: None, 2, now, pause)) and failures[0] == 1)
+    tick[0] = 0.0
+    persistent_observations = []
+    try:
+        transition_wait(lambda: xml(["keyboard"], "com.android.inputmethod.latin"), pairing,
+                        lambda data, active: persistent_observations.append(active), .9, now, pause)
+        checks.append(False)
+    except Refused as observed:
+        checks.append(str(observed) == "UI_TRANSITION_TIMEOUT" and persistent_observations[-1] is False and len(persistent_observations) <= 5)
+    snapshot = ui_diagnostics(xml(["keyboard"], "com.android.inputmethod.latin"),
+                              "mInputShown=true mImeWindowVis=0x3 mCurId=com.android.inputmethod.latin/.LatinIME", True, True)
+    checks.append(can_hide_ime(snapshot, "SETTINGS_TRANSITION"))
+    checks.append(not can_hide_ime({**snapshot, "ownedForeground": False}, "SETTINGS_TRANSITION"))
+    checks.append(not can_hide_ime({**snapshot, "nativePidPresent": False}, "SETTINGS_TRANSITION"))
+    checks.append(not can_hide_ime({**snapshot, "imeVisible": False}, "SETTINGS_TRANSITION"))
+    checks.append(not can_hide_ime({**snapshot, "imeShown": False}, "SETTINGS_TRANSITION"))
+    checks.append(not can_hide_ime(snapshot, "PAIRING_RETURN"))
+    checks.append(can_retain_ui(snapshot, True, False))
+    checks.append(not can_retain_ui(snapshot, False, False))
+    checks.append(not can_retain_ui(snapshot, True, True))
+    checks.append(not can_retain_ui({**snapshot, "nativePidPresent": False}, True, False))
+    checks.append(not can_retain_ui({**snapshot, "packages": ["other.credentials.app"]}, True, False))
+    summary = ui_diagnostics(xml(["PLAYER SETTINGS", "synthetic-private-text"]), "mInputShown=false", True, True)
+    checks.append(summary["ownLabels"] == ["PLAYER SETTINGS"] and "synthetic-private-text" not in json.dumps(summary))
+    checks.append(settings(xml(["PLAYER SETTINGS", "Ready to pair\nActive revision: none", "Privacy policy"])))
+    checks.append(not settings(xml(["PLAYER SETTINGS", "Ready to pair\nActive revision: none", "Privacy policy", "Unpair and remove local content"])))
     need(all(checks), "SYNTHETIC_CHECK_FAILED")
     print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
 
@@ -859,7 +1001,7 @@ if __name__ == "__main__":
         if sys.argv[1:] == ["--self-test"]:
             self_test()
         elif sys.argv[1:] == ["--plan"] or not sys.argv[1:]:
-            print(json.dumps({"mode": "offline-plan", "image": IMAGE, "apkSha256": APK_SHA256, "captures": ["native pairing", "native privacy"], "requiresReviewedPins": True, "networkRequests": 0}))
+            print(json.dumps({"mode": "offline-plan", "image": IMAGE, "apkSha256": APK_SHA256, "captures": ["native pairing", "native standalone settings", "native privacy"], "requiresReviewedPins": True, "networkRequests": 0}))
         elif sys.argv[1:] == ["--run"]:
             run(json.loads(Path(__file__).with_name("pins.json").read_text()))
         else:
