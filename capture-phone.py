@@ -26,7 +26,9 @@ COMPONENT = PACKAGE + "/.MainActivity"
 CATALOG = "https://dl.google.com/android/repository/repository2-3.xml"
 PHONE_CATALOG = "https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-5.xml"
 IMAGE = "system-images;android-36;google_apis;x86_64"
+METADATA = {"emulator": "emulator/package.xml", IMAGE: "system-images/android-36/google_apis/x86_64/package.xml"}
 LICENSE = "1f8729233617b193fd619213792ae16a41b95d2bbbf525dfe66998252ba68b16"
+SDK_LICENSE_SHA1 = "24333f8a63b6825ea9c5514f83c2829b004d1fee"
 W, H = 1080, 1920
 SERIAL, PORT = "emulator-5556", "5038"
 
@@ -54,6 +56,11 @@ def safe_error(error):
         value["sdkDiagnostic"] = error.sdk_diagnostic
     if getattr(error, "cleanup_errors", None):
         value["cleanupErrors"] = error.cleanup_errors
+    if getattr(error, "sdk_package", None) in METADATA:
+        value["sdkPackage"] = error.sdk_package
+        value["expectedMetadata"] = METADATA[error.sdk_package]
+        if type(getattr(error, "source_properties_exists", None)) is bool:
+            value["sourcePropertiesExists"] = error.source_properties_exists
     return value
 
 
@@ -63,13 +70,54 @@ def sdk_diagnostic(output):
         return "SDK_LICENSE_NOT_ACCEPTED"
     if "java_home" in text and any(term in text for term in ("not set", "invalid", "not found")):
         return "SDK_JAVA_HOME_INVALID"
-    if "unsupportedclassversionerror" in text or "java version 17" in text:
+    if "unsupportedclassversionerror" in text or "java version 17 or higher is required" in text:
         return "SDK_JAVA_VERSION_INVALID"
     if "failed to find package" in text or "package path is not valid" in text:
         return "SDK_PACKAGE_UNAVAILABLE"
     if "permission denied" in text or "failed to read or create install properties" in text:
         return "SDK_INSTALL_PERMISSIONS"
     return "SDK_INSTALL_OTHER"
+
+
+def sdk_summary(output):
+    # Fixed markers only: never publish SDK stdout or its untrusted paths/URLs.
+    text = output[-65536:].decode("utf-8", errors="replace").lower()
+    markers = []
+    for marker, match in (("SDK_XML_VERSION_WARNING", "sdk xml" in text and "version" in text),
+                          ("SDK_PACKAGE_LAYOUT_WARNING", "observed package id" in text and "inconsistent location" in text),
+                          ("SDK_INSTALL_PROPERTIES_WARNING", "failed to read or create install properties" in text),
+                          ("SDK_LICENSE_PROMPT", "review licenses" in text or "accept? (y/n)" in text)):
+        if match:
+            markers.append(marker)
+    return markers
+
+
+def check_sdk_result(exit_code, output):
+    diagnostic = sdk_diagnostic(output)
+    if exit_code != 0 or diagnostic != "SDK_INSTALL_OTHER":
+        error = Refused("SDK_INSTALL_FAILED")
+        error.exit_code, error.sdk_diagnostic = exit_code, diagnostic
+        raise error
+    return sdk_summary(output)
+
+
+def inspect_installed(sdk, package, wanted):
+    need(package in METADATA, "INSTALLED_SDK_PACKAGE_UNEXPECTED")
+    manifest = sdk / METADATA[package]
+    try:
+        if not manifest.is_file():
+            raise Refused("INSTALLED_SDK_METADATA_MISSING")
+        need(manifest.stat().st_size <= 1024**2, "INSTALLED_SDK_METADATA_TOO_LARGE")
+        root = ET.fromstring(manifest.read_bytes())
+        matches = [n for n in root if tag(n) == "localPackage" and n.get("path") == package]
+        need(len(matches) == 1 and revision(child(matches[0], "revision")) == wanted, "INSTALLED_SDK_CHANGED")
+    except Exception as error:
+        error.sdk_package = package
+        try:
+            error.source_properties_exists = (manifest.parent / "source.properties").is_file()
+        except OSError:
+            pass  # Optional diagnostics must not replace the metadata failure.
+        raise
 
 
 def with_reviewed_licenses(sdk, state, hashes, operation):
@@ -134,6 +182,15 @@ def revision(node):
     return [int(child(node, n).text) if child(node, n) is not None else 0 for n in ("major", "minor", "micro")]
 
 
+def normalized_license(value):
+    # Exact SDK TrimStringAdapter.unmarshal sequence, verified against the
+    # actual SDK class. Java's default regex \s and String.trim are ASCII here.
+    value = re.sub(r"(?<=\s)[ \t]*", "", value, flags=re.ASCII)
+    value = re.sub(r"(?<!\n)\n(?!\n)", " ", value)
+    value = re.sub(r" +", " ", value)
+    return value.strip("".join(chr(code) for code in range(0x21)))
+
+
 def validate_pins(pins):
     need(pins.get("reviewed") is True, "PHONE_METADATA_REVIEW_PENDING")
     need(pins.get("image") == IMAGE and pins.get("phoneCatalogUrl") == PHONE_CATALOG and pins.get("licenseSha256") == LICENSE,
@@ -163,6 +220,11 @@ def inspect_catalog(data, package, wanted, archive, dependencies, *, expected_li
     need(license_ref is not None and license_ref.get("ref") == "android-sdk-license", "SDK_LICENSE_ID_CHANGED")
     terms = [n.text for n in root if tag(n) == "license" and n.get("id") == "android-sdk-license"]
     need(len(terms) == 1 and hashlib.sha256(terms[0].encode()).hexdigest() == expected_license, "SDK_LICENSE_CHANGED")
+    # Check reviewed raw terms FIRST; canonicalization changes storage format,
+    # never which agreement is accepted. Synthetic terms are unit fixtures only.
+    canonical_hash = hashlib.sha1(normalized_license(terms[0]).encode()).hexdigest()
+    if expected_license == LICENSE:
+        need(canonical_hash == SDK_LICENSE_SHA1, "SDK_LICENSE_CANONICAL_HASH_CHANGED")
     candidates = []
     for entry in child(node, "archives"):
         host = child(entry, "host-os")
@@ -172,7 +234,7 @@ def inspect_catalog(data, package, wanted, archive, dependencies, *, expected_li
             need(checksum is not None and checksum.get("type") == "sha1", "SDK_CHECKSUM_ALGORITHM_CHANGED")
             candidates.append({"url": child(full, "url").text, "size": int(child(full, "size").text), "sha1": checksum.text})
     need(len(candidates) == 1 and candidates[0] == archive, "SDK_ARCHIVE_CHANGED")
-    return {hashlib.sha1(s.encode()).hexdigest() for s in (terms[0], terms[0].strip())}
+    return {canonical_hash}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -291,11 +353,13 @@ def run(pins):
                                     stderr=subprocess.STDOUT, timeout=remaining, cwd=state, env=env)
         need((state / "command.log").stat().st_size <= 8 * 1024**2, "COMMAND_OUTPUT_TOO_LARGE")
         output = (state / "command.log").read_bytes()
+        if code == "SDK_INSTALL_FAILED":
+            evidence["sdkCommandExitCode"] = result.returncode
+            evidence["sdkWarningCodes"] = sdk_summary(output)
+            check_sdk_result(result.returncode, output)
         if result.returncode != 0:
             error = Refused(code)
             error.exit_code = result.returncode
-            if code == "SDK_INSTALL_FAILED":
-                error.sdk_diagnostic = sdk_diagnostic(output)
             raise error
         return output
     adb = sdk / "platform-tools/adb"
@@ -330,11 +394,11 @@ def run(pins):
         need(all(p.exists() for p in (adb, tools / "aapt", tools / "apksigner", manager, avd)), "PREINSTALLED_TOOLS_MISSING")
         licenses = inspect_catalog(fetch(CATALOG, 8*1024**2), "emulator", pins["emulatorRevision"], pins["emulatorArchive"], {})
         licenses |= inspect_catalog(fetch(PHONE_CATALOG, 8*1024**2), IMAGE, pins["imageRevision"], pins["imageArchive"], pins["imageDependencies"])
-        with_reviewed_licenses(sdk, state, licenses, lambda: command([manager, "--channel=0", "emulator", IMAGE], "SDK_INSTALL_FAILED", 480))
-        for folder, package, wanted in (("emulator", "emulator", pins["emulatorRevision"]), ("system-images/android-36/google_apis/x86_64", IMAGE, pins["imageRevision"])):
-            installed = ET.fromstring((sdk / folder / "package.xml").read_bytes())
-            matches = [n for n in installed if tag(n) == "localPackage" and n.get("path") == package]
-            need(len(matches) == 1 and revision(child(matches[0], "revision")) == wanted, "INSTALLED_SDK_CHANGED")
+        with_reviewed_licenses(sdk, state, licenses, lambda: command([manager, "--sdk_root=" + str(sdk), "--channel=0", "emulator", IMAGE], "SDK_INSTALL_FAILED", 480))
+        for package, wanted, validation_stage in (("emulator", pins["emulatorRevision"], "VALIDATE_INSTALLED_EMULATOR"), (IMAGE, pins["imageRevision"], "VALIDATE_INSTALLED_PHONE")):
+            stage = validation_stage
+            stage_history.append(stage)
+            inspect_installed(sdk, package, wanted)
         binary = sdk / "emulator/emulator"
         accel = command([binary, "-accel-check"], "KVM_CHECK_FAILED").decode(errors="replace")
         need(re.search(r"accel:\s*0", accel) and "KVM" in accel, "KVM_CHECK_FAILED")
@@ -422,7 +486,7 @@ def run(pins):
         evidence["stage"], evidence["elapsedSeconds"] = stage, round(time.monotonic() - started)
         evidence["stageHistory"] = stage_history[-32:]
         (artifacts / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
-        print(json.dumps({key: evidence[key] for key in ("status", "stage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
+        print(json.dumps({key: evidence[key] for key in ("status", "stage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "sdkCommandExitCode", "sdkWarningCodes", "sdkPackage", "expectedMetadata", "sourcePropertiesExists", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
 
 
 def self_test():
@@ -560,6 +624,42 @@ def self_test():
     checks.append(sdk_diagnostic(b"Warning: License for package emulator not accepted. synthetic-hidden-value") == "SDK_LICENSE_NOT_ACCEPTED")
     checks.append(sdk_diagnostic(b"Error: JAVA_HOME is set to an invalid directory") == "SDK_JAVA_HOME_INVALID")
     checks.append(sdk_diagnostic(b"unknown synthetic-hidden-value") == "SDK_INSTALL_OTHER")
+    for original, expected_license_text in (("A\nB", "A B"), ("A\n\nB", "A\n\nB"), ("A  B", "A B"),
+                                            ("A\t B", "A\tB"), ("A \t B", "A B"), ("\u00a0A\u00a0", "\u00a0A\u00a0"),
+                                            (" \tAlpha \n    beta  \n\n   gamma\t \n ", "Alpha beta \n\ngamma")):
+        checks.append(normalized_license(original) == expected_license_text)
+    try:
+        check_sdk_result(0, b"Warning: License for package emulator not accepted. synthetic-hidden-value")
+        checks.append(False)
+    except Refused as observed:
+        checks.append(safe_error(observed)["commandExitCode"] == 0 and safe_error(observed)["sdkDiagnostic"] == "SDK_LICENSE_NOT_ACCEPTED")
+    checks.append(check_sdk_result(0, b"All SDK package licenses accepted.") == [])
+    checks.append(sdk_summary(b"Warning: Observed package id 'synthetic-hidden-value' in inconsistent location /synthetic/private-path") == ["SDK_PACKAGE_LAYOUT_WARNING"])
+    with tempfile.TemporaryDirectory(prefix="public-phone-metadata-test-") as temporary:
+        sdk = Path(temporary)
+        (sdk / "emulator").mkdir()
+        (sdk / "emulator/source.properties").write_text("Pkg.Revision=37.2.12\n")
+        try:
+            inspect_installed(sdk, "emulator", [37, 2, 12])
+            checks.append(False)
+        except Refused as observed:
+            detail = safe_error(observed)
+            checks.append(detail["error"] == "INSTALLED_SDK_METADATA_MISSING" and detail["sdkPackage"] == "emulator"
+                          and detail["expectedMetadata"] == "emulator/package.xml" and detail["sourcePropertiesExists"] is True)
+        (sdk / "emulator/package.xml").write_text('<repository><localPackage path="emulator"><revision><major>37</major><minor>2</minor><micro>12</micro></revision></localPackage></repository>')
+        checks.append(inspect_installed(sdk, "emulator", [37, 2, 12]) is None)
+        checks.append(rejects(lambda: inspect_installed(sdk, "emulator", [999, 0, 0])))
+        original_is_file = Path.is_file
+        def fail_optional_diagnostic(path):
+            if Path(path).name == "source.properties":
+                raise PermissionError(13, "synthetic-hidden-message")
+            return False if Path(path).name == "package.xml" else original_is_file(path)
+        with patch.object(Path, "is_file", fail_optional_diagnostic):
+            try:
+                inspect_installed(sdk, "emulator", [37, 2, 12])
+                checks.append(False)
+            except Refused as observed:
+                checks.append(str(observed) == "INSTALLED_SDK_METADATA_MISSING")
     need(all(checks), "SYNTHETIC_CHECK_FAILED")
     print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
 
