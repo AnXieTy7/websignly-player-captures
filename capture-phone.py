@@ -387,6 +387,38 @@ def transition_wait(read, check, observe, seconds=20, clock=time.monotonic, paus
     raise Refused("UI_TRANSITION_TIMEOUT")
 
 
+def verified_capture_sample(read, grab, check, observe, seconds=20, clock=time.monotonic, pause=time.sleep):
+    deadline = clock() + seconds
+    def scene():
+        data = read()
+        try:
+            valid = check(data)
+        except Refused as error:
+            if str(error) != "NATIVE_UI_MISSING":
+                raise
+            valid = None
+        snapshot = observe(data, True)
+        need(snapshot and snapshot["ownedForeground"] and snapshot["nativePidPresent"], "CAPTURE_OWNERSHIP_UNVERIFIED")
+        if snapshot.get("observedSurfaceDismissed") or snapshot.get("immersiveWindowPresent") or valid is None:
+            return None
+        need(valid, "CAPTURE_UI_INVALID")
+        need(set(snapshot["packages"]) == {PACKAGE}, "CAPTURE_UNKNOWN_OVERLAY")
+        return data
+    while clock() < deadline:
+        if scene() is None:
+            pause(.3)
+            continue
+        need(clock() < deadline, "CAPTURE_TRANSIENT_TIMEOUT")
+        pixels = grab()
+        after = scene()
+        if after is None:
+            pause(.3)
+            continue  # Never save pixels sampled while a recognized overlay appeared.
+        need(clock() < deadline, "CAPTURE_TRANSIENT_TIMEOUT")
+        return pixels, after
+    raise Refused("CAPTURE_TRANSIENT_TIMEOUT")
+
+
 def ui_diagnostics(data, input_method, owned_foreground, native_pid):
     root = ET.fromstring(data)
     packages = sorted({n.get("package", "") for n in root.iter("node")
@@ -577,10 +609,13 @@ def run(pins):
             device("shell", "input", "swipe", "540", "1600", "540", "550", "350")
         raise Refused("NATIVE_BUTTON_NOT_FOUND")
     def capture(name, check):
-        need(foreground(device("shell", "dumpsys", "activity", "activities").decode(errors="replace")), "APP_NOT_FOREGROUND")
-        data = dump()
-        need(check(data), "CAPTURE_UI_INVALID")
-        raw = device("exec-out", "screencap", "-p")
+        evidence["uiCapture"] = name
+        def observe_capture(data, active):
+            nonlocal last_observation
+            last_observation = 0  # Final samples require fresh ownership/window state.
+            return observe_transition(data, active)
+        raw, data = verified_capture_sample(dump, lambda: device("exec-out", "screencap", "-p"), check, observe_capture,
+                                            min(20, max(1, deadline - time.monotonic())))
         rgb = png_rgb(raw)
         (artifacts / "raw" / name).write_bytes(raw)
         (artifacts / name).write_bytes(rgb)
@@ -723,7 +758,7 @@ def run(pins):
     except Exception as error:
         evidence["status"] = "failed"
         evidence.update(safe_error(error))
-        if isinstance(error, Refused) and str(error) in {"UI_TRANSITION_TIMEOUT", "NATIVE_UI_MISSING", "PLAYER_LEFT_FOREGROUND_DURING_UI", "PLAYER_NATIVE_PID_UNVERIFIED"}:
+        if isinstance(error, Refused) and str(error) in {"UI_TRANSITION_TIMEOUT", "NATIVE_UI_MISSING", "PLAYER_LEFT_FOREGROUND_DURING_UI", "PLAYER_NATIVE_PID_UNVERIFIED", "CAPTURE_TRANSIENT_TIMEOUT", "CAPTURE_UI_INVALID", "CAPTURE_UNKNOWN_OVERLAY", "CAPTURE_OWNERSHIP_UNVERIFIED"}:
             try:
                 snapshot = observe_transition(dump(), False)
                 if snapshot and can_retain_ui(snapshot, unpaired_flow, evidence["organizationPaired"]):
@@ -791,7 +826,7 @@ def run(pins):
         evidence["stage"], evidence["elapsedSeconds"] = stage, round(time.monotonic() - started)
         evidence["stageHistory"] = stage_history[-32:]
         (artifacts / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
-        print(json.dumps({key: evidence[key] for key in ("status", "stage", "uiStage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "sdkCommandExitCode", "sdkWarningCodes", "sdkPackage", "expectedMetadata", "sourcePropertiesExists", "emulatorExitCode", "bootDeadlineReached", "diskFreeBytesBeforeLaunch", "diskFreeBytesAfterFailure", "bootStartupCodes", "emulatorStopped", "bootOutputRetained", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
+        print(json.dumps({key: evidence[key] for key in ("status", "stage", "uiStage", "uiCapture", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "sdkCommandExitCode", "sdkWarningCodes", "sdkPackage", "expectedMetadata", "sourcePropertiesExists", "emulatorExitCode", "bootDeadlineReached", "diskFreeBytesBeforeLaunch", "diskFreeBytesAfterFailure", "bootStartupCodes", "emulatorStopped", "bootOutputRetained", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
 
 
 def self_test():
@@ -1075,6 +1110,40 @@ def self_test():
     checks.append(can_dismiss_nonsecure_keyguard(keyguard) and keyguard["immersiveWindowPresent"] is True)
     checks.append(not can_dismiss_nonsecure_keyguard({**keyguard, "keyguardSecure": True}))
     checks.append(not can_dismiss_nonsecure_keyguard(window_diagnostics("unknown", "")))
+    def scene_check(data):
+        if data == b"help":
+            raise Refused("NATIVE_UI_MISSING")
+        return data == b"ready"
+    def scene_observer(data, active):
+        return {"ownedForeground": True, "nativePidPresent": True, "packages": [PACKAGE] if data == b"ready" else ["com.android.systemui"],
+                "immersiveWindowPresent": data == b"help", "observedSurfaceDismissed": data == b"help"}
+    tick[0] = 0.0
+    sequence = iter([b"ready", b"help", b"ready", b"ready"])
+    frames, frame_count = iter([b"overlay-frame", b"clean-frame"]), [0]
+    def grab_frame():
+        frame_count[0] += 1
+        return next(frames)
+    accepted, scene = verified_capture_sample(lambda: next(sequence), grab_frame, scene_check, scene_observer, 3, now, pause)
+    checks.append(accepted == b"clean-frame" and frame_count[0] == 2 and scene == b"ready")
+    sequence = iter([b"help", b"ready", b"ready"])
+    grabs = []
+    accepted, scene = verified_capture_sample(lambda: next(sequence), lambda: grabs.append(True) or b"clean", scene_check, scene_observer, 3, now, pause)
+    checks.append(accepted == b"clean" and len(grabs) == 1)
+    tick[0] = 0.0
+    checks.append(rejects(lambda: verified_capture_sample(lambda: b"help", lambda: b"never", scene_check, scene_observer, .9, now, pause)))
+    checks.append(rejects(lambda: verified_capture_sample(lambda: b"invalid", lambda: b"never", scene_check,
+                                                        lambda *_: {"ownedForeground": True, "nativePidPresent": True, "packages": [PACKAGE]}, 1, now, pause)))
+    before_failures = failures[0]
+    checks.append(rejects(lambda: verified_capture_sample(lambda: b"ready", lambda: b"never", invalid_check, scene_observer, 1, now, pause)) and failures[0] == before_failures + 1)
+    checks.append(rejects(lambda: verified_capture_sample(lambda: b"ready", lambda: b"never", scene_check,
+                                                        lambda *_: {"ownedForeground": False, "nativePidPresent": True, "packages": [PACKAGE]}, 1, now, pause)))
+    checks.append(rejects(lambda: verified_capture_sample(lambda: b"ready", lambda: b"never", scene_check,
+                                                        lambda *_: {"ownedForeground": True, "nativePidPresent": False, "packages": [PACKAGE]}, 1, now, pause)))
+    checks.append(rejects(lambda: verified_capture_sample(lambda: b"ready", lambda: b"never", scene_check,
+                                                        lambda *_: {"ownedForeground": True, "nativePidPresent": True, "packages": [PACKAGE, "com.android.systemui"]}, 1, now, pause)))
+    sequence = iter([b"ready", b"invalid"])
+    checks.append(rejects(lambda: verified_capture_sample(lambda: next(sequence), lambda: b"invalid-frame", scene_check,
+                                                        lambda *_: {"ownedForeground": True, "nativePidPresent": True, "packages": [PACKAGE]}, 1, now, pause)))
     need(all(checks), "SYNTHETIC_CHECK_FAILED")
     print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
 
