@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -31,6 +32,8 @@ LICENSE = "1f8729233617b193fd619213792ae16a41b95d2bbbf525dfe66998252ba68b16"
 SDK_LICENSE_SHA1 = "24333f8a63b6825ea9c5514f83c2829b004d1fee"
 W, H = 1080, 1920
 SERIAL, PORT = "emulator-5556", "5038"
+BOOT_LIMIT = 16384
+BOOT_OMISSION = b"\n[bounded startup output: middle omitted]\n"
 
 
 class Refused(Exception):
@@ -90,6 +93,54 @@ def sdk_summary(output):
         if match:
             markers.append(marker)
     return markers
+
+
+def boot_output(data):
+    """Bound and redact official emulator startup output; never app/device logcat."""
+    if len(data) > BOOT_LIMIT:
+        part = (BOOT_LIMIT - len(BOOT_OMISSION)) // 2
+        data = data[:part] + BOOT_OMISSION + data[-part:]
+    text = data.decode("utf-8", errors="replace")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"[^\x09\x0a\x0d\x20-\x7e]", "?", text)
+    text = re.sub(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", "<redacted-jwt>", text)
+    text = re.sub(r"(?i)\b(?:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}|[a-f0-9]{32,})\b", "<redacted-id>", text)
+    text = re.sub(r"(?i)\b(?:[a-f0-9]{2}:){5}[a-f0-9]{2}\b", "<redacted-mac>", text)
+    text = re.sub(r"(?i)\bbearer\s+\S+", "Bearer <redacted>", text)
+    text = re.sub(r"(?i)\b((?:(?:access|refresh|id|api|auth|session|private)[_-]?)?(?:token|key)|authorization|password|secret)\s*[:=]\s*\S+", r"\1=<redacted>", text)
+    text = re.sub(r"\b(?:AIza[A-Za-z0-9_-]{25,}|(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9_-]+)\b", "<redacted-key>", text)
+    text = re.sub(r"\b[A-Za-z0-9_-]{32,}\b", "<redacted-id>", text)
+    text = re.sub(r"https?://[^\s\"'<>]+", "<url>", text)
+    text = re.sub(r"(?<!\w)/(?:home|usr|opt|tmp|var|dev|proc|sys|etc|run)(?:/[^\s\"'<>]+)*", "<path>", text)
+    text = re.sub(r"[A-Za-z]:[\\/][^\s\"'<>]+", "<path>", text)
+    return text.encode("utf-8")[:BOOT_LIMIT].decode("utf-8", errors="ignore")
+
+
+def boot_classifications(data):
+    text = data[-131072:].decode("utf-8", errors="replace").lower()
+    patterns = {"BOOT_DISK_SPACE": r"not enough disk space|no space left on device|insufficient.*disk",
+                "BOOT_CLI_OPTION": r"unknown option|invalid command.line option|invalid value for -gpu",
+                "BOOT_GPU_INIT": r"failed to.*vulkan|failed to.*egl|gpu.*initialization.*fail|invalid gpu mode",
+                "BOOT_HOST_DISPLAY": r"could not initialize sdl|qt platform plugin|could not load.*xcb|libx11.*not found",
+                "BOOT_KVM": r"failed to initialize kvm|kvm.*permission denied|requires hardware acceleration",
+                "BOOT_AVD_PATH": r"broken avd system path|unknown avd name|cannot find avd system path",
+                "BOOT_ADB": r"failed to connect to adb|unable to connect to adb daemon",
+                "BOOT_CRASH": r"segmentation fault|sigsegv|fatal signal 11"}
+    return [code for code, pattern in patterns.items() if re.search(pattern, text)] or ["BOOT_REASON_UNCLASSIFIED"]
+
+
+def disk_free(sdk, state):
+    result = {}
+    for name, path in (("sdk", sdk), ("state", state)):
+        try:
+            result[name] = shutil.disk_usage(path).free
+        except OSError:
+            result[name] = None
+    return result
+
+
+def can_retain_boot(status, apk_install_started, organization_paired, process_started, emulator_stopped):
+    return status == "failed" and not apk_install_started and not organization_paired and process_started and emulator_stopped
 
 
 def check_sdk_result(exit_code, output):
@@ -337,7 +388,7 @@ def run(pins):
     artifacts.mkdir(mode=0o700)
     (artifacts / "raw").mkdir(mode=0o700)
     deadline, started, process, stage = time.monotonic() + 18 * 60, time.monotonic(), None, "preflight"
-    adb_started = False
+    adb_started, apk_install_started = False, False
     env = {**os.environ, "ANDROID_AVD_HOME": str(state / "avd"), "ANDROID_USER_HOME": str(state / "android-user"), "ANDROID_ADB_SERVER_PORT": PORT}
     evidence = {"status": "running", "distribution": "public standalone APK; shared pairing/privacy UI", "phoneImage": IMAGE,
                 "apkSha256": APK_SHA256, "organizationPaired": False, "playStoreInstallVerified": False, "captures": []}
@@ -418,6 +469,7 @@ def run(pins):
                 probe.bind(("127.0.0.1", port))
         command([adb, "-P", PORT, "start-server"], "OWN_ADB_START_FAILED")
         adb_started = True
+        evidence["diskFreeBytesBeforeLaunch"] = disk_free(sdk, state)
         with (state / "emulator.log").open("wb") as log:
             process = subprocess.Popen([str(binary), "-avd", "PublicPhoneCapture", "-port", "5556", "-no-window", "-no-audio", "-no-boot-anim",
                                         "-no-snapshot", "-no-metrics", "-gpu", "swiftshader", "-accel", "on", "-cores", "2", "-memory", "3072",
@@ -431,7 +483,11 @@ def run(pins):
             except Refused:
                 pass
             time.sleep(3)
-        need(booted, "PHONE_BOOT_FAILED")
+        if not booted:
+            evidence["emulatorExitCode"] = process.poll()
+            evidence["bootDeadlineReached"] = time.monotonic() >= boot_end
+            evidence["diskFreeBytesAfterFailure"] = disk_free(sdk, state)
+            raise Refused("PHONE_BOOT_FAILED")
         need(device("shell", "getprop", "ro.build.version.sdk").strip() == b"36" and device("shell", "getprop", "ro.product.cpu.abi").strip() == b"x86_64", "PHONE_OS_IDENTITY_INVALID")
         features = device("shell", "pm", "list", "features").decode(errors="replace")
         need("android.hardware.touchscreen" in features and "android.hardware.type.television" not in features, "PHONE_FORM_FACTOR_INVALID")
@@ -439,6 +495,7 @@ def run(pins):
         device("shell", "settings", "put", "secure", "user_setup_complete", "1")
         device("shell", "wm", "size", "1080x1920")
         device("shell", "wm", "density", "420")
+        apk_install_started = True
         device("install", "--no-streaming", apk, seconds=60)
         device("shell", "am", "start", "-W", "-n", COMPONENT)
         ready_end, ready = min(deadline, time.monotonic() + 75), False
@@ -468,25 +525,63 @@ def run(pins):
         evidence.update(safe_error(error))
         raise
     finally:
+        evidence["apkInstallAttempted"] = apk_install_started
+        emulator_stopped = process is None
         if process is not None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=10)
-            except Exception:
+            evidence.setdefault("emulatorExitCode", process.poll())
+            for signal_value, wait_seconds in ((signal.SIGTERM, 8), (signal.SIGKILL, 3)):
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=5)
+                    os.killpg(process.pid, signal_value)
                 except ProcessLookupError:
+                    emulator_stopped = True
+                    break
+                except OSError as error:
+                    evidence.setdefault("cleanupErrors", []).append(safe_error(error))
+                    break
+                try:
+                    process.wait(timeout=wait_seconds)
+                except subprocess.TimeoutExpired:
                     pass
+                stop_deadline = time.monotonic() + 1
+                while time.monotonic() < stop_deadline:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        emulator_stopped = True
+                        break
+                    except OSError:
+                        break
+                    time.sleep(.1)
+                if emulator_stopped:
+                    break
+            evidence["emulatorStopped"] = emulator_stopped
         if adb_started:
             try:
                 subprocess.run([str(adb), "-P", PORT, "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=env)
             except Exception:
                 pass
+        if evidence["status"] == "failed" and not apk_install_started and not evidence["organizationPaired"] and process is not None:
+            try:
+                with (state / "emulator.log").open("rb") as log:
+                    size = log.seek(0, 2)
+                    log.seek(0)
+                    if size > BOOT_LIMIT:
+                        part = (BOOT_LIMIT - len(BOOT_OMISSION)) // 2
+                        head = log.read(part)
+                        log.seek(-part, 2)
+                        data = head + BOOT_OMISSION + log.read(part)
+                    else:
+                        data = log.read(BOOT_LIMIT)
+                evidence["bootStartupCodes"] = boot_classifications(data)
+                evidence["bootOutputRetained"] = can_retain_boot(evidence["status"], apk_install_started, evidence["organizationPaired"], True, emulator_stopped)
+                if evidence["bootOutputRetained"]:
+                    (artifacts / "boot-output-redacted.txt").write_text(boot_output(data))
+            except Exception as error:
+                evidence["bootOutputDiagnosticError"] = safe_error(error)
         evidence["stage"], evidence["elapsedSeconds"] = stage, round(time.monotonic() - started)
         evidence["stageHistory"] = stage_history[-32:]
         (artifacts / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
-        print(json.dumps({key: evidence[key] for key in ("status", "stage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "sdkCommandExitCode", "sdkWarningCodes", "sdkPackage", "expectedMetadata", "sourcePropertiesExists", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
+        print(json.dumps({key: evidence[key] for key in ("status", "stage", "error", "exceptionType", "errno", "operationPhase", "commandExitCode", "sdkDiagnostic", "sdkCommandExitCode", "sdkWarningCodes", "sdkPackage", "expectedMetadata", "sourcePropertiesExists", "emulatorExitCode", "bootDeadlineReached", "diskFreeBytesBeforeLaunch", "diskFreeBytesAfterFailure", "bootStartupCodes", "emulatorStopped", "bootOutputRetained", "cleanupErrors") if key in evidence} | {"captures": len(evidence["captures"])}))
 
 
 def self_test():
@@ -660,6 +755,23 @@ def self_test():
                 checks.append(False)
             except Refused as observed:
                 checks.append(str(observed) == "INSTALLED_SDK_METADATA_MISSING")
+    sensitive = b'PANIC: Not enough disk space in /home/runner/private-path\n token=synthetic-sensitive-value key=another-sensitive-value Authorization: Bearer fake-bearer-value\n aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee 01:23:45:67:89:ab https://example.invalid/?token=hidden C:\\Users\\Synthetic\\private\n aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc\n'
+    sanitized = boot_output(sensitive)
+    checks.append("PANIC: Not enough disk space" in sanitized)
+    checks.append(all(value not in sanitized for value in ("synthetic-sensitive-value", "another-sensitive-value", "fake-bearer-value", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "01:23:45:67:89:ab", "private-path", "example.invalid", "Synthetic", "aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc")))
+    checks.append(len(boot_output(b"x" * 200000).encode()) <= BOOT_LIMIT and "middle omitted" in boot_output(b"x" * 200000))
+    checks.append(boot_classifications(b"PANIC: Not enough disk space to run AVD") == ["BOOT_DISK_SPACE"])
+    checks.append(boot_classifications(b"Unknown option: -synthetic") == ["BOOT_CLI_OPTION"])
+    checks.append(boot_classifications(b"nothing recognized") == ["BOOT_REASON_UNCLASSIFIED"])
+    checks.append(can_retain_boot("failed", False, False, True, True))
+    checks.append(not can_retain_boot("passed", False, False, True, True))
+    checks.append(not can_retain_boot("failed", True, False, True, True))
+    checks.append(not can_retain_boot("failed", False, True, True, True))
+    checks.append(not can_retain_boot("failed", False, False, False, True))
+    checks.append(not can_retain_boot("failed", False, False, True, False))
+    with tempfile.TemporaryDirectory(prefix="public-phone-disk-test-") as temporary:
+        free = disk_free(Path(temporary), Path(temporary))
+        checks.append(type(free["sdk"]) is int and free["sdk"] > 0 and free["state"] > 0)
     need(all(checks), "SYNTHETIC_CHECK_FAILED")
     print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
 
