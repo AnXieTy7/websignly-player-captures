@@ -374,7 +374,7 @@ def transition_wait(read, check, observe, seconds=20, clock=time.monotonic, paus
         try:
             if check(last):
                 observed = observe(last, True)
-                if isinstance(observed, dict) and observed.get("imeDismissAttempted"):
+                if isinstance(observed, dict) and observed.get("observedSurfaceDismissed"):
                     pause(.3)
                     continue
                 return last
@@ -400,6 +400,39 @@ def ui_diagnostics(data, input_method, owned_foreground, native_pid):
     ime_packages = sorted(set(re.findall(r"(?:mCurId|mCurMethodId)\s*=\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)/", input_method)))[:4]
     return {"ownedForeground": owned_foreground, "nativePidPresent": native_pid,
             "imeShown": shown, "imeVisible": visible, "imePackages": ime_packages, "packages": packages, "ownLabels": labels}
+
+
+def window_diagnostics(policy, windows):
+    block = policy.split("KeyguardServiceDelegate", 1)[-1] if "KeyguardServiceDelegate" in policy else ""
+    result = {"immersiveWindowPresent": "ImmersiveModeConfirmation" in windows}
+    for field in ("showing", "inputRestricted", "occluded", "secure"):
+        match = re.search(r"(?m)^\s*" + field + r"\s*=\s*(true|false)\b", block)
+        result["keyguard" + field[0].upper() + field[1:]] = None if match is None else match.group(1) == "true"
+    return result
+
+
+def fullscreen_help_target(data, snapshot):
+    if not snapshot["ownedForeground"] or not snapshot["nativePidPresent"] or snapshot.get("keyguardShowing") is True or snapshot.get("keyguardSecure") is True:
+        return None
+    nodes = [n for n in ET.fromstring(data).iter("node") if n.get("package") == "com.android.systemui"]
+    if not nodes or any(n.get("password") == "true" for n in nodes):
+        return None
+    title = any("Viewing full screen" in (n.get("text", ""), n.get("content-desc", "")) for n in nodes)
+    description = any(n.get("resource-id") == "com.android.systemui:id/immersive_cling_description"
+                      and n.get("text") == "To exit, swipe down from the top of your screen" for n in nodes)
+    buttons = [n for n in nodes if n.get("resource-id") == "com.android.systemui:id/ok" and n.get("text") == "Got it"
+               and n.get("class") == "android.widget.Button" and n.get("clickable") == "true" and n.get("enabled") == "true"]
+    if not description or not (title or snapshot.get("immersiveWindowPresent") is True) or len(buttons) != 1:
+        return None
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", buttons[0].get("bounds", ""))
+    if not match:
+        return None
+    x1, y1, x2, y2 = map(int, match.groups())
+    return ((x1+x2)//2, (y1+y2)//2) if 0 <= x1 < x2 <= W and 0 <= y1 < y2 <= H else None
+
+
+def can_dismiss_nonsecure_keyguard(snapshot):
+    return snapshot.get("keyguardShowing") is True and snapshot.get("keyguardSecure") is False
 
 
 def can_hide_ime(snapshot, phase):
@@ -494,6 +527,7 @@ def run(pins):
     deadline, started, process, stage = time.monotonic() + 18 * 60, time.monotonic(), None, "preflight"
     adb_started, apk_install_started = False, False
     unpaired_flow, ime_hidden, last_observation = False, False, 0.0
+    fullscreen_acknowledged, keyguard_dismissed = False, False
     ui_phase, last_ui_data, last_ui_snapshot = "PAIRING_WAIT", b"<hierarchy/>", None
     env = {**os.environ, "ANDROID_AVD_HOME": str(avd_home), "ANDROID_USER_HOME": str(user_home), "ANDROID_ADB_SERVER_PORT": PORT}
     evidence = {"status": "running", "distribution": "public standalone APK; pairing/privacy shared, settings channel may differ", "phoneImage": IMAGE,
@@ -553,7 +587,7 @@ def run(pins):
         evidence["captures"].append({"name": name, "width": W, "height": H, "rgbBytes": len(rgb), "rgbSha256": hashlib.sha256(rgb).hexdigest(), "rawSha256": hashlib.sha256(raw).hexdigest()})
         return data
     def observe_transition(data, allow_hide):
-        nonlocal last_observation, ime_hidden, last_ui_data, last_ui_snapshot
+        nonlocal last_observation, ime_hidden, last_ui_data, last_ui_snapshot, fullscreen_acknowledged, keyguard_dismissed
         last_ui_data = data
         if allow_hide and time.monotonic() - last_observation < 1:
             return
@@ -565,11 +599,30 @@ def run(pins):
             native_pid = False
         method = device("shell", "dumpsys", "input_method").decode(errors="replace")
         snapshot = ui_diagnostics(data, method, owned, native_pid)
+        snapshot.update(window_diagnostics(device("shell", "dumpsys", "window", "policy").decode(errors="replace"),
+                                           device("shell", "dumpsys", "window", "windows").decode(errors="replace")))
+        known_help = {"Viewing full screen", "To exit, swipe down from the top of your screen", "Got it"}
+        snapshot["knownSystemUiLabels"] = sorted({n.get(key) for n in ET.fromstring(data).iter("node")
+                                                  if n.get("package") == "com.android.systemui" for key in ("text", "content-desc") if n.get(key) in known_help})
         last_ui_snapshot = snapshot
         evidence.setdefault("uiDiagnostics", []).append({"phase": ui_phase, **snapshot})
         evidence["uiDiagnostics"] = evidence["uiDiagnostics"][-8:]
+        target = fullscreen_help_target(data, snapshot)
+        if allow_hide and target is not None and not fullscreen_acknowledged:
+            fullscreen_acknowledged = True
+            evidence["fullscreenHelpAcknowledgementAttempted"] = True
+            snapshot["observedSurfaceDismissed"] = True
+            device("shell", "input", "tap", str(target[0]), str(target[1]))
+            return snapshot  # Never use pre-tap IME/keyguard state for another action.
+        if allow_hide and owned and native_pid and not keyguard_dismissed and can_dismiss_nonsecure_keyguard(snapshot):
+            keyguard_dismissed = True
+            evidence["nonsecureKeyguardDismissed"] = True
+            snapshot["observedSurfaceDismissed"] = True
+            device("shell", "wm", "dismiss-keyguard")
+            return snapshot  # A fresh poll must observe the newly exposed surface.
         if allow_hide and not ime_hidden and can_hide_ime(snapshot, ui_phase):
             snapshot["imeDismissAttempted"] = True
+            snapshot["observedSurfaceDismissed"] = True
             evidence.setdefault("imeDismissals", []).append(ui_phase)
             ime_hidden = True
             device("shell", "input", "keyevent", "KEYCODE_BACK")
@@ -644,16 +697,16 @@ def run(pins):
         device("shell", "settings", "put", "secure", "user_setup_complete", "1")
         device("shell", "wm", "size", "1080x1920")
         device("shell", "wm", "density", "420")
+        device("shell", "input", "keyevent", "KEYCODE_WAKEUP")
+        keyguard = window_diagnostics(device("shell", "dumpsys", "window", "policy").decode(errors="replace"), "")
+        evidence["initialKeyguardState"] = keyguard
+        if can_dismiss_nonsecure_keyguard(keyguard):
+            device("shell", "wm", "dismiss-keyguard")
+            keyguard_dismissed = True
         apk_install_started = True
         device("install", "--no-streaming", apk, seconds=60)
         device("shell", "am", "start", "-W", "-n", COMPONENT)
-        ready_end, ready = min(deadline, time.monotonic() + 75), False
-        while time.monotonic() < ready_end:
-            if pairing(dump()):
-                ready = True
-                break
-            time.sleep(3)
-        need(ready, "PAIRING_UI_NOT_READY")
+        wait_ui("PAIRING_WAIT", pairing, 75)
         pairing_data = capture("01-pairing.png", pairing)
         unpaired_flow = True
         tap_text("Settings", pairing_data)
@@ -962,6 +1015,14 @@ def self_test():
     checks.append(transition_wait(lambda: next(transient), lambda data: "ready" in [n.get("text") for n in ui(data)],
                                   lambda data, active: observations.append(active), 2, now, pause) == xml(["ready"]))
     checks.append(observations == [True, True])
+    refreshed = []
+    def read_after_surface():
+        refreshed.append(True)
+        return xml(["ready"])
+    def observe_surface(data, active):
+        return {"observedSurfaceDismissed": len(refreshed) == 1}
+    transition_wait(read_after_surface, lambda data: True, observe_surface, 2, now, pause)
+    checks.append(len(refreshed) == 2)
     failures = [0]
     def invalid_check(data):
         failures[0] += 1
@@ -992,6 +1053,28 @@ def self_test():
     checks.append(summary["ownLabels"] == ["PLAYER SETTINGS"] and "synthetic-private-text" not in json.dumps(summary))
     checks.append(settings(xml(["PLAYER SETTINGS", "Ready to pair\nActive revision: none", "Privacy policy"])))
     checks.append(not settings(xml(["PLAYER SETTINGS", "Ready to pair\nActive revision: none", "Privacy policy", "Unpair and remove local content"])))
+    def help_xml(body="To exit, swipe down from the top of your screen", button_id="com.android.systemui:id/ok", package="com.android.systemui", title=True):
+        root = ET.Element("hierarchy")
+        if title:
+            ET.SubElement(root, "node", {"package": package, "text": "Viewing full screen"})
+        ET.SubElement(root, "node", {"package": package, "text": body, "resource-id": "com.android.systemui:id/immersive_cling_description"})
+        ET.SubElement(root, "node", {"package": package, "text": "Got it", "resource-id": button_id, "class": "android.widget.Button", "clickable": "true", "enabled": "true", "bounds": "[600,1400][1000,1600]"})
+        return ET.tostring(root)
+    help_state = {"ownedForeground": True, "nativePidPresent": True, "keyguardShowing": False, "keyguardSecure": False, "immersiveWindowPresent": True}
+    checks.append(fullscreen_help_target(help_xml(), help_state) == (800, 1500))
+    checks.append(fullscreen_help_target(help_xml(title=False), help_state) == (800, 1500))
+    checks.append(fullscreen_help_target(help_xml(title=False), {**help_state, "immersiveWindowPresent": False}) is None)
+    checks.append(fullscreen_help_target(help_xml(body="Review and accept these terms"), help_state) is None)
+    checks.append(fullscreen_help_target(help_xml(button_id="com.android.systemui:id/unrelated"), help_state) is None)
+    checks.append(fullscreen_help_target(help_xml(package=PACKAGE), help_state) is None)
+    checks.append(fullscreen_help_target(help_xml(), {**help_state, "ownedForeground": False}) is None)
+    checks.append(fullscreen_help_target(help_xml(), {**help_state, "nativePidPresent": False}) is None)
+    checks.append(fullscreen_help_target(help_xml(), {**help_state, "keyguardShowing": True}) is None)
+    checks.append(fullscreen_help_target(help_xml(), {**help_state, "keyguardSecure": True}) is None)
+    keyguard = window_diagnostics("KeyguardServiceDelegate\n  showing=true\n  inputRestricted=true\n  occluded=false\n  secure=false\n", "Window ImmersiveModeConfirmation")
+    checks.append(can_dismiss_nonsecure_keyguard(keyguard) and keyguard["immersiveWindowPresent"] is True)
+    checks.append(not can_dismiss_nonsecure_keyguard({**keyguard, "keyguardSecure": True}))
+    checks.append(not can_dismiss_nonsecure_keyguard(window_diagnostics("unknown", "")))
     need(all(checks), "SYNTHETIC_CHECK_FAILED")
     print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
 
