@@ -1,0 +1,21 @@
+{
+  "reviewed": true,
+  "image": "system-images;android-36;google_apis;x86_64",
+  "phoneCatalogUrl": "https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-5.xml",
+  "imageRevision": [7, 0, 0],
+  "imageDependencies": {"emulator": [35, 4, 9]},
+  "imageArchive": {"url": "x86_64-36_r07.zip", "size": 1895447397, "sha1": "c6bf44bdcd885bb902b4ba752d111a073ad7a817"},
+  "emulatorRevision": [37, 2, 12],
+  "emulatorArchive": {
+    "url": "emulator-linux_x64-16428233.zip",
+    "size": 349654171,
+    "sha1": "cd7362ea55dfb86a418958138dc396e74165dd01"
+  },
+  "licenseSha256": "1f8729233617b193fd619213792ae16a41b95d2bbbf525dfe66998252ba68b16",
+  "metadataCheckedAt": "2026-10-27",
+  "metadataSha256": {
+    "addonsList7": "152ce2d50ee3ed4b5866f447dbba9b8c3a82aee41e487bd0a56c84f0e21b2d25",
+    "phoneCatalog": "35ed0538fe78be1eb8fc4bc3841060008a89336b6a14e767752b35d8161f8329",
+    "emulatorCatalog": "1f0ca6d8b3109ab83afc3e409d53626659b8a233a908e477ac83017919339296"
+  }
+}

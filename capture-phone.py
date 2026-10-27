@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""Generic public-APK-only native phone captures. No private source or keys."""
+from __future__ import annotations
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+import zlib
+
+APK_URL = "https://websignly.com/downloads/websignly.apk"
+APK_SHA256 = "2dde063ecbb5cebfcebca67e63a56ef83671934eb22895801071765fb7e0e549"
+APK_BYTES = 1535256
+CERT = "9883d1be43f1cac101668091fb5796ad261b04b5ad2abb1de81cd43fbe78aa05"
+PACKAGE = "com.websignly.player"
+COMPONENT = PACKAGE + "/.MainActivity"
+CATALOG = "https://dl.google.com/android/repository/repository2-3.xml"
+PHONE_CATALOG = "https://dl.google.com/android/repository/sys-img/google_apis/sys-img2-5.xml"
+IMAGE = "system-images;android-36;google_apis;x86_64"
+LICENSE = "1f8729233617b193fd619213792ae16a41b95d2bbbf525dfe66998252ba68b16"
+W, H = 1080, 1920
+SERIAL, PORT = "emulator-5556", "5038"
+
+
+class Refused(Exception):
+    pass
+
+
+def need(value, code):
+    if not value:
+        raise Refused(code)
+
+
+def tag(node):
+    return node.tag.rsplit("}", 1)[-1]
+
+
+def child(node, name):
+    return next((n for n in node if tag(n) == name), None)
+
+
+def revision(node):
+    need(node is not None, "SDK_REVISION_MISSING")
+    return [int(child(node, n).text) if child(node, n) is not None else 0 for n in ("major", "minor", "micro")]
+
+
+def validate_pins(pins):
+    need(pins.get("reviewed") is True, "PHONE_METADATA_REVIEW_PENDING")
+    need(pins.get("image") == IMAGE and pins.get("phoneCatalogUrl") == PHONE_CATALOG and pins.get("licenseSha256") == LICENSE,
+         "SDK_PIN_IDENTITY_INVALID")
+    for key in ("imageRevision", "emulatorRevision"):
+        need(isinstance(pins.get(key), list) and len(pins[key]) == 3 and all(type(n) is int and n >= 0 for n in pins[key]), "SDK_PIN_REVISION_INVALID")
+    need(isinstance(pins.get("imageDependencies"), dict), "SDK_PIN_DEPENDENCIES_INVALID")
+    for key in ("imageArchive", "emulatorArchive"):
+        value = pins.get(key)
+        need(isinstance(value, dict) and re.fullmatch(r"[A-Za-z0-9_.-]+\.zip", value.get("url", ""))
+             and type(value.get("size")) is int and 0 < value["size"] <= 3 * 1024**3
+             and re.fullmatch(r"[a-f0-9]{40}", value.get("sha1", "")), "SDK_PIN_ARCHIVE_INVALID")
+
+
+def inspect_catalog(data, package, wanted, archive, dependencies, *, expected_license=LICENSE):
+    need(len(data) <= 8 * 1024**2, "SDK_CATALOG_TOO_LARGE")
+    root = ET.fromstring(data)
+    matches = [n for n in root if tag(n) == "remotePackage" and n.get("path") == package
+               and child(n, "channelRef") is not None and child(n, "channelRef").get("ref") == "channel-0"]
+    need(len(matches) == 1, "SDK_PACKAGE_CHANGED")
+    node = matches[0]
+    need(revision(child(node, "revision")) == wanted and node.get("obsolete") != "true", "SDK_REVISION_CHANGED")
+    deps = child(node, "dependencies")
+    actual = {n.get("path"): revision(child(n, "min-revision")) for n in deps} if deps is not None else {}
+    need(actual == dependencies, "SDK_DEPENDENCIES_CHANGED")
+    license_ref = child(node, "uses-license")
+    need(license_ref is not None and license_ref.get("ref") == "android-sdk-license", "SDK_LICENSE_ID_CHANGED")
+    terms = [n.text for n in root if tag(n) == "license" and n.get("id") == "android-sdk-license"]
+    need(len(terms) == 1 and hashlib.sha256(terms[0].encode()).hexdigest() == expected_license, "SDK_LICENSE_CHANGED")
+    candidates = []
+    for entry in child(node, "archives"):
+        host = child(entry, "host-os")
+        if host is None or host.text == "linux":
+            full = child(entry, "complete")
+            checksum = child(full, "checksum")
+            need(checksum is not None and checksum.get("type") == "sha1", "SDK_CHECKSUM_ALGORITHM_CHANGED")
+            candidates.append({"url": child(full, "url").text, "size": int(child(full, "size").text), "sha1": checksum.text})
+    need(len(candidates) == 1 and candidates[0] == archive, "SDK_ARCHIVE_CHANGED")
+    return {hashlib.sha1(s.encode()).hexdigest() for s in (terms[0], terms[0].strip())}
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_a, **_kw):
+        raise Refused("DOWNLOAD_REDIRECT_REFUSED")
+
+
+def fetch(url, maximum):
+    need(url in (APK_URL, CATALOG, PHONE_CATALOG), "DOWNLOAD_ORIGIN_REFUSED")
+    with urllib.request.build_opener(NoRedirect).open(urllib.request.Request(url, headers={"User-Agent": "NativePhoneCapture/1"}), timeout=30) as response:
+        need(response.status == 200, "DOWNLOAD_STATUS_INVALID")
+        data = response.read(maximum + 1)
+    need(len(data) <= maximum, "DOWNLOAD_TOO_LARGE")
+    return data
+
+
+def ui(data):
+    need(len(data) <= 2 * 1024**2, "UI_DUMP_TOO_LARGE")
+    nodes = [n for n in ET.fromstring(data).iter("node") if n.get("package") == PACKAGE]
+    need(nodes, "NATIVE_UI_MISSING")
+    return nodes
+
+
+def pairing(data):
+    values = [n.get("text", "") for n in ui(data)]
+    return any(re.fullmatch(r"[0-9]{6}", t) for t in values) and any("Your next great screen" in t for t in values)
+
+
+def privacy(data):
+    values = [n.get("text", "") for n in ui(data)]
+    return "WebSignly privacy policy" in values and any("WebOrbit LLC" in t for t in values) and "Close" in values and not any("Loading privacy policy" in t for t in values)
+
+
+def foreground(value):
+    return any("ResumedActivity" in line and re.search(r"com\.websignly\.player/(?:\.MainActivity|com\.websignly\.player\.MainActivity)(?=[\s}])", line) for line in value.splitlines())
+
+
+def png_rgb(data, width=W, height=H):
+    need(len(data) <= 12 * 1024**2 and data[:8] == b"\x89PNG\r\n\x1a\n", "CAPTURE_NOT_PNG")
+    offset, compressed, channels, done = 8, bytearray(), None, False
+    while offset + 12 <= len(data):
+        length = struct.unpack_from(">I", data, offset)[0]
+        kind, body = data[offset + 4:offset + 8], data[offset + 8:offset + 8 + length]
+        need(length <= 12 * 1024**2 and offset + length + 12 <= len(data), "PNG_TRUNCATED")
+        need(zlib.crc32(kind + body) & 0xffffffff == struct.unpack_from(">I", data, offset + length + 8)[0], "PNG_CRC_INVALID")
+        if kind == b"IHDR":
+            need(channels is None and len(body) == 13, "PNG_HEADER_INVALID")
+            actual_w, actual_h, depth, colour, compression, filtering, interlace = struct.unpack(">IIBBBBB", body)
+            need((actual_w, actual_h, depth, colour, compression, filtering, interlace) in [(width, height, 8, c, 0, 0, 0) for c in (2, 6)], "PNG_DIMENSIONS_INVALID")
+            channels = 3 if colour == 2 else 4
+        elif kind == b"IDAT":
+            compressed.extend(body)
+        elif kind == b"IEND":
+            need(length == 0, "PNG_END_INVALID")
+            done = True
+        offset += length + 12
+        if done:
+            break
+    need(channels is not None and done and offset == len(data), "PNG_INCOMPLETE")
+    size = height * (width * channels + 1)
+    decoder = zlib.decompressobj()
+    packed = decoder.decompress(compressed, size + 1)
+    need(decoder.eof and not decoder.unused_data and len(packed) == size, "PNG_PIXELS_INVALID")
+    previous, rgb, values = bytearray(width * channels), bytearray(), set()
+    for y in range(height):
+        begin = y * (width * channels + 1)
+        method, row = packed[begin], bytearray(packed[begin + 1:begin + width * channels + 1])
+        need(method <= 4, "PNG_FILTER_INVALID")
+        for x in range(len(row)):
+            left = row[x - channels] if x >= channels else 0
+            up, corner = previous[x], previous[x - channels] if x >= channels else 0
+            estimate = left + up - corner
+            distances = [abs(estimate - n) for n in (left, up, corner)]
+            paeth = (left, up, corner)[distances.index(min(distances))]
+            row[x] = (row[x] + (0, left, up, (left + up) // 2, paeth)[method]) & 255
+        need(channels == 3 or all(row[x] == 255 for x in range(3, len(row), 4)), "PNG_TRANSLUCENT_REFUSED")
+        visible = row if channels == 3 else bytearray(v for x, v in enumerate(row) if x % 4 != 3)
+        values.update(visible)
+        rgb.extend(b"\0" + visible)
+        previous = row
+    need(len(values) > 16, "CAPTURE_BLANK")
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rgb, 6)) + chunk(b"IEND", b"")
+
+
+def run(pins):
+    validate_pins(pins)  # Refuse incomplete review before even catalog network access.
+    need(sys.platform == "linux" and os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+         and os.environ.get("PHONE_CAPTURE_APPROVED") == "true" and os.environ.get("PUBLIC_STANDARD_RUNNER_VERIFIED") == "true", "MANUAL_PUBLIC_WORKFLOW_REQUIRED")
+    need((os.cpu_count() or 0) >= 4 and os.access("/dev/kvm", os.R_OK | os.W_OK), "FREE_KVM_RUNNER_REQUIRED")
+    sdk = Path(os.environ.get("ANDROID_HOME", "")).resolve()
+    need(sdk == Path("/usr/local/lib/android/sdk"), "RUNNER_SDK_UNEXPECTED")
+    temporary = Path(os.environ.get("RUNNER_TEMP", "")).resolve()
+    need(str(temporary).startswith("/home/runner/work/") and temporary.is_dir(), "RUNNER_TEMP_UNEXPECTED")
+    state = temporary / "public-apk-phone-capture"
+    need(not state.exists(), "STATE_ALREADY_EXISTS")
+    state.mkdir(mode=0o700)
+    artifacts = state / "artifacts"
+    artifacts.mkdir(mode=0o700)
+    (artifacts / "raw").mkdir(mode=0o700)
+    deadline, started, process, stage = time.monotonic() + 18 * 60, time.monotonic(), None, "preflight"
+    adb_started = False
+    env = {**os.environ, "ANDROID_AVD_HOME": str(state / "avd"), "ANDROID_USER_HOME": str(state / "android-user"), "ANDROID_ADB_SERVER_PORT": PORT}
+    evidence = {"status": "running", "distribution": "public standalone APK; shared pairing/privacy UI", "phoneImage": IMAGE,
+                "apkSha256": APK_SHA256, "organizationPaired": False, "playStoreInstallVerified": False, "captures": []}
+    def command(args, code, seconds=60, data=None):
+        nonlocal stage
+        stage = code
+        remaining = min(seconds, int(deadline - time.monotonic()))
+        need(remaining > 0, "TIME_BUDGET_EXHAUSTED")
+        with (state / "command.log").open("wb") as stream:
+            result = subprocess.run([str(a) for a in args], input=data, stdin=subprocess.DEVNULL if data is None else None, stdout=stream,
+                                    stderr=subprocess.STDOUT, timeout=remaining, cwd=state, env=env)
+        need(result.returncode == 0, code)
+        need((state / "command.log").stat().st_size <= 8 * 1024**2, "COMMAND_OUTPUT_TOO_LARGE")
+        return (state / "command.log").read_bytes()
+    adb = sdk / "platform-tools/adb"
+    tools = sdk / "build-tools/35.0.0"
+    manager, avd = [sdk / ("cmdline-tools/latest/bin/" + n) for n in ("sdkmanager", "avdmanager")]
+    def device(*args, seconds=30):
+        return command([adb, "-P", PORT, "-s", SERIAL, *args], "ADB_OPERATION_FAILED", seconds)
+    def dump():
+        device("shell", "uiautomator", "dump", "--compressed", "/data/local/tmp/phone-ui.xml")
+        return device("exec-out", "cat", "/data/local/tmp/phone-ui.xml")
+    def tap_text(text):
+        for _ in range(7):
+            for n in ui(dump()):
+                if n.get("text") == text and n.get("enabled") == "true":
+                    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds", ""))
+                    if match:
+                        x1, y1, x2, y2 = map(int, match.groups())
+                        if 0 <= x1 < x2 <= W and 0 <= y1 < y2 <= H:
+                            device("shell", "input", "tap", str((x1+x2)//2), str((y1+y2)//2))
+                            return
+            device("shell", "input", "swipe", "540", "1600", "540", "550", "350")
+        raise Refused("NATIVE_BUTTON_NOT_FOUND")
+    def capture(name, check):
+        need(foreground(device("shell", "dumpsys", "activity", "activities").decode(errors="replace")), "APP_NOT_FOREGROUND")
+        need(check(dump()), "CAPTURE_UI_INVALID")
+        raw = device("exec-out", "screencap", "-p")
+        rgb = png_rgb(raw)
+        (artifacts / "raw" / name).write_bytes(raw)
+        (artifacts / name).write_bytes(rgb)
+        evidence["captures"].append({"name": name, "width": W, "height": H, "rgbBytes": len(rgb), "rgbSha256": hashlib.sha256(rgb).hexdigest(), "rawSha256": hashlib.sha256(raw).hexdigest()})
+    try:
+        need(all(p.exists() for p in (adb, tools / "aapt", tools / "apksigner", manager, avd)), "PREINSTALLED_TOOLS_MISSING")
+        licenses = inspect_catalog(fetch(CATALOG, 8*1024**2), "emulator", pins["emulatorRevision"], pins["emulatorArchive"], {})
+        licenses |= inspect_catalog(fetch(PHONE_CATALOG, 8*1024**2), IMAGE, pins["imageRevision"], pins["imageArchive"], pins["imageDependencies"])
+        license_dir, backup = sdk / "licenses", state / "runner-licenses"
+        if license_dir.exists():
+            license_dir.rename(backup)
+        license_dir.mkdir()
+        license_file = license_dir / "android-sdk-license"
+        try:
+            license_file.write_text("\n".join(sorted(licenses)) + "\n")
+            command([manager, "--channel=0", "emulator", IMAGE], "SDK_INSTALL_FAILED", 480)
+        finally:
+            license_file.unlink(missing_ok=True)
+            license_dir.rmdir()
+            if backup.exists():
+                backup.rename(license_dir)
+        for folder, package, wanted in (("emulator", "emulator", pins["emulatorRevision"]), ("system-images/android-36/google_apis/x86_64", IMAGE, pins["imageRevision"])):
+            installed = ET.fromstring((sdk / folder / "package.xml").read_bytes())
+            matches = [n for n in installed if tag(n) == "localPackage" and n.get("path") == package]
+            need(len(matches) == 1 and revision(child(matches[0], "revision")) == wanted, "INSTALLED_SDK_CHANGED")
+        binary = sdk / "emulator/emulator"
+        accel = command([binary, "-accel-check"], "KVM_CHECK_FAILED").decode(errors="replace")
+        need(re.search(r"accel:\s*0", accel) and "KVM" in accel, "KVM_CHECK_FAILED")
+        apk = state / "public.apk"
+        data = fetch(APK_URL, APK_BYTES)
+        need(len(data) == APK_BYTES and hashlib.sha256(data).hexdigest() == APK_SHA256, "PUBLIC_APK_HASH_MISMATCH")
+        apk.write_bytes(data)
+        signature = command([tools / "apksigner", "verify", "--print-certs", apk], "PUBLIC_APK_SIGNATURE_INVALID").decode(errors="replace")
+        need("Signer #1 certificate SHA-256 digest: " + CERT in signature, "PUBLIC_APK_CERTIFICATE_UNEXPECTED")
+        badging = command([tools / "aapt", "dump", "badging", apk], "PUBLIC_APK_MANIFEST_INVALID").decode(errors="replace")
+        need("name='com.websignly.player'" in badging and "versionCode='4'" in badging and "versionName='1.0.3'" in badging, "PUBLIC_APK_IDENTITY_UNEXPECTED")
+        profiles = command([avd, "list", "devices"], "PHONE_PROFILE_MISSING").decode(errors="replace")
+        need('"pixel_2"' in profiles, "PHONE_PROFILE_MISSING")
+        command([avd, "create", "avd", "-n", "PublicPhoneCapture", "-k", IMAGE, "-d", "pixel_2"], "AVD_CREATE_FAILED", data=b"no\n")
+        for port in (int(PORT), 5556, 5557):
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", port))
+        command([adb, "-P", PORT, "start-server"], "OWN_ADB_START_FAILED")
+        adb_started = True
+        with (state / "emulator.log").open("wb") as log:
+            process = subprocess.Popen([str(binary), "-avd", "PublicPhoneCapture", "-port", "5556", "-no-window", "-no-audio", "-no-boot-anim",
+                                        "-no-snapshot", "-no-metrics", "-gpu", "swiftshader", "-accel", "on", "-cores", "2", "-memory", "3072",
+                                        "-camera-back", "none", "-camera-front", "none"], stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        boot_end, booted = min(deadline, time.monotonic() + 240), False
+        while time.monotonic() < boot_end and process.poll() is None:
+            try:
+                booted = device("shell", "getprop", "sys.boot_completed", seconds=10).strip() == b"1"
+                if booted:
+                    break
+            except Refused:
+                pass
+            time.sleep(3)
+        need(booted, "PHONE_BOOT_FAILED")
+        need(device("shell", "getprop", "ro.build.version.sdk").strip() == b"36" and device("shell", "getprop", "ro.product.cpu.abi").strip() == b"x86_64", "PHONE_OS_IDENTITY_INVALID")
+        features = device("shell", "pm", "list", "features").decode(errors="replace")
+        need("android.hardware.touchscreen" in features and "android.hardware.type.television" not in features, "PHONE_FORM_FACTOR_INVALID")
+        device("shell", "settings", "put", "global", "device_provisioned", "1")
+        device("shell", "settings", "put", "secure", "user_setup_complete", "1")
+        device("shell", "wm", "size", "1080x1920")
+        device("shell", "wm", "density", "420")
+        device("install", "--no-streaming", apk, seconds=60)
+        device("shell", "am", "start", "-W", "-n", COMPONENT)
+        ready_end, ready = min(deadline, time.monotonic() + 75), False
+        while time.monotonic() < ready_end:
+            if pairing(dump()):
+                ready = True
+                break
+            time.sleep(3)
+        need(ready, "PAIRING_UI_NOT_READY")
+        capture("01-pairing.png", pairing)
+        tap_text("Settings")
+        tap_text("Privacy policy")
+        ready_end, ready = min(deadline, time.monotonic() + 45), False
+        while time.monotonic() < ready_end:
+            if privacy(dump()):
+                ready = True
+                break
+            time.sleep(3)
+        need(ready, "PRIVACY_UI_NOT_READY")
+        capture("02-privacy.png", privacy)
+        device("shell", "input", "keyevent", "KEYCODE_BACK")
+        device("shell", "input", "keyevent", "KEYCODE_BACK")
+        need(pairing(dump()), "DIALOG_BACK_FAILED")
+        evidence["status"] = "passed"
+    except Exception as error:
+        evidence["status"], evidence["error"] = "failed", str(error) if isinstance(error, Refused) else "CAPTURE_OPERATION_FAILED"
+        raise
+    finally:
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=10)
+            except Exception:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+                except ProcessLookupError:
+                    pass
+        if adb_started:
+            try:
+                subprocess.run([str(adb), "-P", PORT, "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=env)
+            except Exception:
+                pass
+        evidence["stage"], evidence["elapsedSeconds"] = stage, round(time.monotonic() - started)
+        (artifacts / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        print(json.dumps({"status": evidence["status"], "stage": stage, "captures": len(evidence["captures"])}))
+
+
+def self_test():
+    # In-memory fixtures only. Never export synthetic PNGs as captures.
+    def rejects(call):
+        try:
+            call()
+        except Refused:
+            return True
+        return False
+    def xml(values, package=PACKAGE):
+        root = ET.Element("hierarchy")
+        for value in values:
+            ET.SubElement(root, "node", {"package": package, "text": value})
+        return ET.tostring(root)
+    checks = [rejects(lambda: validate_pins({})), pairing(xml(["123456", "Your next great screen"])),
+              not pairing(xml(["··· ···", "Your next great screen"])), rejects(lambda: ui(xml(["123456"], "foreign"))),
+              privacy(xml(["WebSignly privacy policy", "WebOrbit LLC", "Close"])),
+              not privacy(xml(["WebSignly privacy policy", "Loading privacy policy…", "Close"])),
+              foreground("topResumedActivity=ActivityRecord{ test com.websignly.player/.MainActivity t1}"),
+              not foreground("topResumedActivity=ActivityRecord{ test other/.MainActivity t1}"),
+              rejects(lambda: png_rgb(b"not-png"))]
+    def fixture(rows, channels, method):
+        previous, encoded = bytes(len(rows[0])), bytearray()
+        for row in rows:
+            encoded.append(method)
+            for x, sample in enumerate(row):
+                left = row[x - channels] if x >= channels else 0
+                up, corner = previous[x], previous[x - channels] if x >= channels else 0
+                estimate = left + up - corner
+                paeth = min(enumerate((left, up, corner)), key=lambda pair: (abs(estimate - pair[1]), pair[0]))[1]
+                encoded.append((sample - (0, left, up, (left + up) // 2, paeth)[method]) & 255)
+            previous = row
+        def chunk(kind, body):
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff)
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 2, 8, 2 if channels == 3 else 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(encoded, 6)) + chunk(b"IEND", b"")
+    rgb_rows = [bytes(range(24)), bytes(range(41, 65))]
+    rgba_rows = [b"".join(row[x:x+3] + b"\xff" for x in range(0, len(row), 3)) for row in rgb_rows]
+    expected = fixture(rgb_rows, 3, 0)
+    for channels, rows in ((3, rgb_rows), (4, rgba_rows)):
+        for method in range(5):
+            checks.append(png_rgb(fixture(rows, channels, method), 8, 2) == expected)
+    translucent = [rgba_rows[0][:-1] + b"\0", rgba_rows[1]]
+    checks.extend([rejects(lambda: png_rgb(fixture(translucent, 4, 0), 8, 2)),
+                   rejects(lambda: png_rgb(expected)), rejects(lambda: png_rgb(expected[:-1] + b"\0", 8, 2))])
+    pins = json.loads(Path(__file__).with_name("pins.json").read_text())
+    validate_pins(pins)
+    fixture_license = "Synthetic unit-test terms; never approval of an SDK license."
+    fixture_license_hash = hashlib.sha256(fixture_license.encode()).hexdigest()
+    def catalog(package, wanted, archive, dependencies):
+        root = ET.Element("sdk-repository")
+        ET.SubElement(root, "license", {"id": "android-sdk-license"}).text = fixture_license
+        node = ET.SubElement(root, "remotePackage", {"path": package})
+        def rev(parent, name, values):
+            target = ET.SubElement(parent, name)
+            for key, value in zip(("major", "minor", "micro"), values):
+                ET.SubElement(target, key).text = str(value)
+        rev(node, "revision", wanted)
+        ET.SubElement(node, "channelRef", {"ref": "channel-0"})
+        ET.SubElement(node, "uses-license", {"ref": "android-sdk-license"})
+        if dependencies:
+            deps = ET.SubElement(node, "dependencies")
+            for path, values in dependencies.items():
+                rev(ET.SubElement(deps, "dependency", {"path": path}), "min-revision", values)
+        entry = ET.SubElement(ET.SubElement(node, "archives"), "archive")
+        ET.SubElement(entry, "host-os").text = "linux"
+        complete = ET.SubElement(entry, "complete")
+        ET.SubElement(complete, "url").text = archive["url"]
+        ET.SubElement(complete, "size").text = str(archive["size"])
+        ET.SubElement(complete, "checksum", {"type": "sha1"}).text = archive["sha1"]
+        return ET.tostring(root)
+    image_catalog = catalog(IMAGE, pins["imageRevision"], pins["imageArchive"], pins["imageDependencies"])
+    emulator_catalog = catalog("emulator", pins["emulatorRevision"], pins["emulatorArchive"], {})
+    def inspect_fixture(data, package, wanted, archive, deps):
+        return inspect_catalog(data, package, wanted, archive, deps, expected_license=fixture_license_hash)
+    checks.append(inspect_fixture(image_catalog, IMAGE, pins["imageRevision"], pins["imageArchive"], pins["imageDependencies"]) is not None)
+    checks.append(inspect_fixture(emulator_catalog, "emulator", pins["emulatorRevision"], pins["emulatorArchive"], {}) is not None)
+    checks.append(rejects(lambda: inspect_fixture(image_catalog, IMAGE, [999, 0, 0], pins["imageArchive"], pins["imageDependencies"])))
+    checks.append(rejects(lambda: inspect_fixture(image_catalog, IMAGE, pins["imageRevision"], pins["imageArchive"], {})))
+    checks.append(rejects(lambda: inspect_fixture(image_catalog, IMAGE, pins["imageRevision"], {**pins["imageArchive"], "sha1": "0" * 40}, pins["imageDependencies"])))
+    checks.append(rejects(lambda: inspect_catalog(image_catalog, IMAGE, pins["imageRevision"], pins["imageArchive"], pins["imageDependencies"])))
+    need(all(checks), "SYNTHETIC_CHECK_FAILED")
+    print(json.dumps({"passed": True, "checks": len(checks), "networkRequests": 0, "sdkInstalls": 0, "emulatorStarts": 0}))
+
+
+if __name__ == "__main__":
+    try:
+        if sys.argv[1:] == ["--self-test"]:
+            self_test()
+        elif sys.argv[1:] == ["--plan"] or not sys.argv[1:]:
+            print(json.dumps({"mode": "offline-plan", "image": IMAGE, "apkSha256": APK_SHA256, "captures": ["native pairing", "native privacy"], "requiresReviewedPins": True, "networkRequests": 0}))
+        elif sys.argv[1:] == ["--run"]:
+            run(json.loads(Path(__file__).with_name("pins.json").read_text()))
+        else:
+            raise Refused("USE_PLAN_SELF_TEST_OR_RUN")
+    except Exception as error:
+        print(json.dumps({"status": "refused", "error": str(error) if isinstance(error, Refused) else "CAPTURE_OPERATION_FAILED"}))
+        sys.exit(1)

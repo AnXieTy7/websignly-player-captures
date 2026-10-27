@@ -1,0 +1,51 @@
+name: Manual public APK phone captures
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_and_challenge_ack:
+        description: Approve the exact pinned Android SDK license and anonymous pairing challenge
+        required: true
+        type: boolean
+        default: false
+      free_public_runner_verified:
+        description: Owner verified this is a standard free public-repository Linux runner
+        required: true
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: public-apk-phone-capture
+  cancel-in-progress: false
+jobs:
+  capture:
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.private == false && inputs.sdk_and_challenge_ack == true && inputs.free_public_runner_verified == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    env:
+      PHONE_CAPTURE_APPROVED: 'true'
+      PUBLIC_STANDARD_RUNNER_VERIFIED: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Synthetic guard tests only
+        run: python3 -I -B capture-phone.py --self-test
+      - name: Permit KVM on disposable runner only
+        run: |
+          test -c /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Capture genuine Android phone pairing and privacy UI
+        run: python3 -I -B capture-phone.py --run
+      - name: Retain PNGs and sanitized evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-phone-${{ github.run_id }}
+          path: ${{ runner.temp }}/public-apk-phone-capture/artifacts/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
