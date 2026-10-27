@@ -33,15 +33,29 @@ jobs:
         run: python3 -I -B capture-phone.py --self-test
       - name: Permit KVM on disposable runner only
         run: |
-          test -c /dev/kvm
+          set -euxo pipefail
+          printf 'KVM_HOST cpus=%s architecture=%s\n' "$(nproc)" "$(uname -m)"
+          # Apply GitHub's documented static-node rule before asserting that
+          # the device exists. A fresh runner need not expose it beforehand.
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          test -r /dev/kvm && test -w /dev/kvm
+          sudo udevadm settle --timeout=10
+          if ! test -c /dev/kvm; then
+            echo 'KVM_DEVICE_MISSING_AFTER_UDEV'
+            lsmod | awk 'NR == 1 || $1 ~ /^kvm/ {print}'
+            exit 1
+          fi
+          stat --format='KVM_DEVICE type=%F mode=%a owner=%U group=%G' /dev/kvm
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            echo 'KVM_DEVICE_PERMISSION_DENIED'
+            exit 1
+          fi
       - name: Capture genuine Android phone pairing and privacy UI
+        id: capture
         run: python3 -I -B capture-phone.py --run
       - name: Retain PNGs and sanitized evidence only
-        if: always()
+        if: always() && steps.capture.outcome != 'skipped'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-phone-${{ github.run_id }}
