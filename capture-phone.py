@@ -758,7 +758,11 @@ def run(pins):
         privacy_data = capture("03-privacy.png", privacy)
         tap_text("Close", privacy_data)
         returned_settings = wait_ui("SETTINGS_TRANSITION", settings)
-        tap_text("Resume playback", returned_settings)
+        # Exercise the documented TV/phone Back behavior from verified Settings;
+        # framework positive-button text is transformed to uppercase on API36.
+        need(settings(returned_settings), "SETTINGS_EXIT_SCENE_INVALID")
+        device("shell", "input", "keyevent", "KEYCODE_BACK")
+        evidence["settingsExit"] = "Android Back"
         wait_ui("PAIRING_RETURN", pairing)
         evidence["status"] = "passed"
     except Exception as error:
