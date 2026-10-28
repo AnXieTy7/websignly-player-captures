@@ -1,6 +1,6 @@
 # Public APK native phone capture helper
 
-This versioned public-app QA helper captures genuine Android phone screenshots from the already public WebSignly Player1.0.3/code4 APK. It contains no application source, signing material, private repository references, account credentials, or organization pairing inputs. Run40459876443 reached the real API36 app and captured pairing, then stopped on a missing UI tree during Settings/Privacy navigation. The revised transition handling awaits owner-run verification; offline checks do not establish complete UI success.
+This versioned public-app QA helper captures genuine Android phone screenshots from the already public WebSignly Player1.0.4/code5 APK. It contains no application source, signing material, private repository references, account credentials, or organization pairing inputs. Run40464501925 captured real pairing and Settings on API36, then rejected a blank Privacy viewer. This capture pins the corrected public build; native verification remains required.
 
 Publish exactly four files: `README.md`, `pins.json`, `capture-phone.py`, and `.github/workflows/capture-phone.yml`. The `metadata-*.xml` snapshots alongside this local review pack stay local and are not required or published. Self-tests create catalog fixtures in memory and never read those snapshots. At runtime the helper fetches and validates the actual official catalogs and exact reviewed license; synthetic fixture terms cannot authorize SDK installation.
 
@@ -12,7 +12,7 @@ Google's catalog publishes **SHA1**, not SHA256, for the1,895,447,397-byte phone
 
 The reviewed raw license SHA256 remains `1f8729233617b193fd619213792ae16a41b95d2bbbf525dfe66998252ba68b16`. Only after that exact check, the helper applies the SDK's verified `TrimStringAdapter.unmarshal` normalization and writes the SDK acceptance SHA1 `24333f8a63b6825ea9c5514f83c2829b004d1fee`. The normalization and hash were cross-checked against the actual cached SDK class using the same public XML; this accepts the same agreement, not new terms. Raw/outer-trimmed text hashes are not written as acceptance tokens.
 
-Root must first deploy the public 1.0.3/code4 APK and verify its URL serves exactly 1,535,256 bytes with SHA256 `2dde063ecbb5cebfcebca67e63a56ef83671934eb22895801071765fb7e0e549`. Redirects, unexpected APK bytes/certificate/package/version, image revisions, terms or archive metadata fail closed.
+Root must first deploy the public 1.0.4/code5 APK and verify its URL serves exactly 1,535,724 bytes with SHA256 `8d5f58b6d3b25995bb76ad85492980fa1c180fb99f47a2c0f6960602736abe25`. Redirects, unexpected APK bytes/certificate/package/version, image revisions, terms or archive metadata fail closed.
 
 Only an owner-started `workflow_dispatch` in a public repository may run. Both acknowledgement inputs default false; no push/PR trigger exists. The owner must verify the selected standard public Linux runner is free. This helper does not authorize a private-repository or larger paid runner. Maximum job time is22 minutes; script deadline18 minutes; artifact retention3 days. It requires KVM and at least4 CPUs, with no software-emulation fallback. No dispatch is authorized merely by preparing these files.
 

@@ -19,8 +19,8 @@ import xml.etree.ElementTree as ET
 import zlib
 
 APK_URL = "https://websignly.com/downloads/websignly.apk"
-APK_SHA256 = "2dde063ecbb5cebfcebca67e63a56ef83671934eb22895801071765fb7e0e549"
-APK_BYTES = 1535256
+APK_SHA256 = "8d5f58b6d3b25995bb76ad85492980fa1c180fb99f47a2c0f6960602736abe25"
+APK_BYTES = 1535724
 CERT = "9883d1be43f1cac101668091fb5796ad261b04b5ad2abb1de81cd43fbe78aa05"
 PACKAGE = "com.websignly.player"
 COMPONENT = PACKAGE + "/.MainActivity"
@@ -690,7 +690,7 @@ def run(pins):
         signature = command([tools / "apksigner", "verify", "--print-certs", apk], "PUBLIC_APK_SIGNATURE_INVALID").decode(errors="replace")
         need("Signer #1 certificate SHA-256 digest: " + CERT in signature, "PUBLIC_APK_CERTIFICATE_UNEXPECTED")
         badging = command([tools / "aapt", "dump", "badging", apk], "PUBLIC_APK_MANIFEST_INVALID").decode(errors="replace")
-        need("name='com.websignly.player'" in badging and "versionCode='4'" in badging and "versionName='1.0.3'" in badging, "PUBLIC_APK_IDENTITY_UNEXPECTED")
+        need("name='com.websignly.player'" in badging and "versionCode='5'" in badging and "versionName='1.0.4'" in badging, "PUBLIC_APK_IDENTITY_UNEXPECTED")
         profiles = command([avd, "list", "devices"], "PHONE_PROFILE_MISSING").decode(errors="replace")
         need('"pixel_2"' in profiles, "PHONE_PROFILE_MISSING")
         need(not avd_data.exists(), "AVD_DATA_ALREADY_EXISTS")
