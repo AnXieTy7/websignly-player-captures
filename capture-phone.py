@@ -426,7 +426,7 @@ def ui_diagnostics(data, input_method, owned_foreground, native_pid):
     shown = bool(re.search(r"(?:mInputShown|isInputShown)\s*=\s*true\b", input_method))
     visible = (bool(re.search(r"mIsInputViewShown\s*=\s*true\b", input_method)) or
                any(int(value, 16) & 2 for value in re.findall(r"mImeWindowVis\s*=\s*0x([0-9a-fA-F]+)", input_method)))
-    allowed_labels = ("PLAYER SETTINGS", "Privacy policy", "Ready to pair", "Active revision: none", "Proof events waiting: 0", "WebSignly privacy policy", "Close")
+    allowed_labels = ("PLAYER SETTINGS", "Privacy policy", "Ready to pair", "Active revision: none", "Proof events waiting: 0", "WebSignly privacy policy", "Close", "CLOSE")
     labels = sorted({label for n in root.iter("node") if n.get("package") == PACKAGE
                      for label in allowed_labels if label in n.get("text", "")})
     ime_packages = sorted(set(re.findall(r"(?:mCurId|mCurMethodId)\s*=\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)/", input_method)))[:4]
@@ -481,9 +481,15 @@ def can_retain_ui(snapshot, unpaired_flow, organization_paired):
             and set(snapshot["packages"]).issubset(allowed))
 
 
+def label_matches(actual, expected):
+    # API36 native Button styling exposes the observed uppercase CLOSE label.
+    # Keep all other labels exact and accept only these two known forms.
+    return actual == expected or (expected == "Close" and actual == "CLOSE")
+
+
 def privacy(data):
     values = [n.get("text", "") for n in ui(data)]
-    return "WebSignly privacy policy" in values and any("WebOrbit LLC" in t for t in values) and "Close" in values and not any("Loading privacy policy" in t for t in values)
+    return "WebSignly privacy policy" in values and any("WebOrbit LLC" in t for t in values) and any(label_matches(t, "Close") for t in values) and not any("Loading privacy policy" in t for t in values)
 
 
 def foreground(value):
@@ -599,7 +605,7 @@ def run(pins):
             data = initial if initial is not None else dump()
             initial = None
             for n in ui(data):
-                if n.get("text") == text and n.get("enabled") == "true":
+                if label_matches(n.get("text"), text) and n.get("enabled") == "true":
                     match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds", ""))
                     if match:
                         x1, y1, x2, y2 = map(int, match.groups())
@@ -845,6 +851,11 @@ def self_test():
     checks = [rejects(lambda: validate_pins({})), pairing(xml(["123456", "Your next great screen"])),
               not pairing(xml(["··· ···", "Your next great screen"])), rejects(lambda: ui(xml(["123456"], "foreign"))),
               privacy(xml(["WebSignly privacy policy", "WebOrbit LLC", "Close"])),
+              privacy(xml(["WebSignly privacy policy", "WebOrbit LLC", "CLOSE"])),
+              not privacy(xml(["WebSignly privacy policy", "CLOSE"])),
+              not privacy(xml(["WebSignly privacy policy", "WebOrbit LLC", "Close account"])),
+              label_matches("CLOSE", "Close"), not label_matches("CLOSE account", "Close"),
+              not label_matches("SETTINGS", "Settings"),
               not privacy(xml(["WebSignly privacy policy", "Loading privacy policy…", "Close"])),
               foreground("topResumedActivity=ActivityRecord{ test com.websignly.player/.MainActivity t1}"),
               not foreground("topResumedActivity=ActivityRecord{ test other/.MainActivity t1}"),
